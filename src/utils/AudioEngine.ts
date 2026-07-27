@@ -494,32 +494,79 @@ export class AudioEngine {
   }
 
   play() {
-    if (!this.buffer) return;
+    if (!this.buffer && this.tracks.length === 0) return;
     this.resumeContext();
     
-    this.source = this.ctx.createBufferSource();
-    this.source.buffer = this.buffer;
+    const offset = this.pauseTime;
     
-    if (this.isLooping) {
-      this.source.loop = true;
-      this.source.loopStart = this.loopStart;
-      this.source.loopEnd = this.loopEnd;
+    if (this.buffer) {
+      this.source = this.ctx.createBufferSource();
+      this.source.buffer = this.buffer;
+
+      if (this.isLooping) {
+        this.source.loop = true;
+        this.source.loopStart = this.loopStart;
+        this.source.loopEnd = this.loopEnd;
+      }
+
+      this.source.onended = () => {
+        if (this.isPlaying && this.getCurrentTime() >= this.getDuration()) {
+          this.isPlaying = false;
+          this.pauseTime = 0;
+          this.onEnded();
+          this.onStateChange();
+        }
+      };
+
+      this.connectNodes();
+      this.applyEffects(this.effects);
+
+      this.source.start(0, offset);
     }
     
-    this.source.onended = () => {
-      if (this.isPlaying && this.getCurrentTime() >= this.getDuration()) {
-        this.isPlaying = false;
-        this.pauseTime = 0;
-        this.onEnded();
-        this.onStateChange();
+    // Play multi-track mixer tracks in sync!
+    const hasSolo = this.tracks.some(t => t.solo);
+    this.tracks.forEach(track => {
+      if (track.sourceNode) {
+        try { track.sourceNode.stop(); } catch (e) {}
+        track.sourceNode = undefined;
       }
-    };
 
-    this.connectNodes();
-    this.applyEffects(this.effects);
+      if (offset >= track.buffer.duration && !this.isLooping) {
+        return;
+      }
+
+      const sourceNode = this.ctx.createBufferSource();
+      sourceNode.buffer = track.buffer;
+
+      const gainNode = this.ctx.createGain();
+      if (hasSolo) {
+        gainNode.gain.value = track.solo && !track.muted ? track.volume : 0;
+      } else {
+        gainNode.gain.value = track.muted ? 0 : track.volume;
+      }
+
+      const pannerNode = this.ctx.createStereoPanner();
+      pannerNode.pan.value = track.pan;
+
+      sourceNode.connect(gainNode);
+      gainNode.connect(pannerNode);
+      pannerNode.connect(this.compressorNode); // Route to compressor / master bus!
+
+      track.sourceNode = sourceNode;
+      track.gainNode = gainNode;
+      track.pannerNode = pannerNode;
+
+      if (this.isLooping) {
+        sourceNode.loop = true;
+        sourceNode.loopStart = this.loopStart;
+        sourceNode.loopEnd = this.loopEnd;
+      }
+
+      const trackStartOffset = this.isLooping ? (offset % track.buffer.duration) : offset;
+      sourceNode.start(0, trackStartOffset);
+    });
     
-    const offset = this.pauseTime;
-    this.source.start(0, offset);
     this.startTime = this.ctx.currentTime - (offset / this.effects.speed);
     this.isPlaying = true;
     this.onStateChange();
@@ -528,13 +575,36 @@ export class AudioEngine {
   pause() {
     if (!this.isPlaying) return;
     this.pauseTime = this.getCurrentTime();
-    this.source?.stop();
+
+    if (this.source) {
+      try { this.source.stop(); } catch (e) {}
+      this.source = null;
+    }
+
+    this.tracks.forEach(track => {
+      if (track.sourceNode) {
+        try { track.sourceNode.stop(); } catch (e) {}
+        track.sourceNode = undefined;
+      }
+    });
+
     this.isPlaying = false;
     this.onStateChange();
   }
 
   stop() {
-    this.source?.stop();
+    if (this.source) {
+      try { this.source.stop(); } catch (e) {}
+      this.source = null;
+    }
+
+    this.tracks.forEach(track => {
+      if (track.sourceNode) {
+        try { track.sourceNode.stop(); } catch (e) {}
+        track.sourceNode = undefined;
+      }
+    });
+
     this.pauseTime = 0;
     this.isPlaying = false;
     this.onStateChange();
@@ -558,7 +628,13 @@ export class AudioEngine {
   }
 
   getDuration(): number {
-    return this.buffer ? this.buffer.duration : 0;
+    let maxDur = this.buffer ? this.buffer.duration : 0;
+    this.tracks.forEach(t => {
+      if (t.buffer.duration > maxDur) {
+        maxDur = t.buffer.duration;
+      }
+    });
+    return maxDur;
   }
 
   getAnalyserData(): Uint8Array {
@@ -590,11 +666,53 @@ export class AudioEngine {
     const id = Math.random().toString(36).substring(7);
     const track: Track = { id, name, buffer, muted: false, solo: false, volume: 1, pan: 0 };
     this.tracks.push(track);
+
+    // If playing, start this track immediately in sync!
+    if (this.isPlaying) {
+      const offset = this.getCurrentTime();
+      if (offset < buffer.duration || this.isLooping) {
+        const sourceNode = this.ctx.createBufferSource();
+        sourceNode.buffer = buffer;
+
+        const gainNode = this.ctx.createGain();
+        const hasSolo = this.tracks.some(t => t.solo);
+        if (hasSolo) {
+          gainNode.gain.value = track.solo && !track.muted ? track.volume : 0;
+        } else {
+          gainNode.gain.value = track.muted ? 0 : track.volume;
+        }
+
+        const pannerNode = this.ctx.createStereoPanner();
+        pannerNode.pan.value = track.pan;
+
+        sourceNode.connect(gainNode);
+        gainNode.connect(pannerNode);
+        pannerNode.connect(this.compressorNode);
+
+        track.sourceNode = sourceNode;
+        track.gainNode = gainNode;
+        track.pannerNode = pannerNode;
+
+        if (this.isLooping) {
+          sourceNode.loop = true;
+          sourceNode.loopStart = this.loopStart;
+          sourceNode.loopEnd = this.loopEnd;
+        }
+
+        const trackStartOffset = this.isLooping ? (offset % buffer.duration) : offset;
+        sourceNode.start(0, trackStartOffset);
+      }
+    }
+
     this.rebuildMixer();
     this.onStateChange();
   }
 
   removeTrack(id: string) {
+    const track = this.tracks.find(t => t.id === id);
+    if (track && track.sourceNode) {
+      try { track.sourceNode.stop(); } catch (e) {}
+    }
     this.tracks = this.tracks.filter(t => t.id !== id);
     this.rebuildMixer();
     this.onStateChange();
@@ -809,31 +927,146 @@ export class AudioEngine {
 
   // --- Export ---
   async exportWAV(): Promise<Blob> {
-    if (!this.buffer) throw new Error("No audio loaded");
-    const duration = this.buffer.duration;
+    let maxDur = this.buffer ? this.buffer.duration : 0;
+    this.tracks.forEach(t => {
+      if (t.buffer.duration > maxDur) {
+        maxDur = t.buffer.duration;
+      }
+    });
+    if (maxDur === 0) throw new Error("No audio loaded to export");
+
     const exportSpeed = this.effects.speed;
-    const totalDuration = (duration / exportSpeed) + (this.effects.reverb > 0 ? 2 : 0) + (this.effects.delay > 0 ? 1 : 0);
+    const totalDuration = (maxDur / exportSpeed) + (this.effects.reverb > 0 ? 2 : 0) + (this.effects.delay > 0 ? 1 : 0);
     
     const offlineCtx = new (window.OfflineAudioContext || (window as any).webkitOfflineAudioContext)(
       2, 
-      offlineCtxSampleRate(this.ctx.sampleRate, totalDuration), 
+      Math.floor(this.ctx.sampleRate * totalDuration),
       this.ctx.sampleRate
     );
 
-    function offlineCtxSampleRate(sr: number, d: number) { return sr * d; }
+    // Recreate master effects chain in offline context
+    const hpNode = offlineCtx.createBiquadFilter();
+    hpNode.type = 'highpass';
+    hpNode.frequency.value = this.effects.highpass;
+
+    const lpNode = offlineCtx.createBiquadFilter();
+    lpNode.type = 'lowpass';
+    lpNode.frequency.value = this.effects.lowpass;
+
+    const bassNode = offlineCtx.createBiquadFilter();
+    bassNode.type = 'lowshelf';
+    bassNode.frequency.value = 200;
+    bassNode.gain.value = this.effects.bass;
+
+    const trebleNode = offlineCtx.createBiquadFilter();
+    trebleNode.type = 'highshelf';
+    trebleNode.frequency.value = 8000;
+    trebleNode.gain.value = this.effects.treble;
+
+    const eqNodes: BiquadFilterNode[] = [];
+    this.effects.eqBands.forEach((band) => {
+      const node = offlineCtx.createBiquadFilter();
+      node.type = band.type;
+      node.frequency.value = band.freq;
+      node.gain.value = band.gain;
+      node.Q.value = band.q;
+      eqNodes.push(node);
+    });
+
+    const distortionNode = offlineCtx.createWaveShaper();
+    distortionNode.oversample = '4x';
+    distortionNode.curve = this.effects.distortion > 0 ? this.makeDistortionCurve(this.effects.distortion) : null;
+
+    const delayNode = offlineCtx.createDelay(1.0);
+    delayNode.delayTime.value = this.effects.delay / 1000;
+    const delayMix = offlineCtx.createGain();
+    delayMix.gain.value = this.effects.delay > 0 ? 0.5 : 0;
+
+    const reverbNode = offlineCtx.createConvolver();
+    reverbNode.buffer = this.reverbNode.buffer;
+    const reverbMix = offlineCtx.createGain();
+    reverbMix.gain.value = this.effects.reverb;
+
+    const pannerNode = offlineCtx.createStereoPanner();
+    const pannerLfo = offlineCtx.createOscillator();
+    pannerLfo.type = 'sine';
+    pannerLfo.frequency.value = 0.15;
+    const pannerLfoGain = offlineCtx.createGain();
+    pannerLfoGain.gain.value = this.effects.pan8D;
+
+    pannerLfo.connect(pannerLfoGain);
+    pannerLfoGain.connect(pannerNode.pan);
+    pannerLfo.start(0);
+
+    const compressorNode = offlineCtx.createDynamicsCompressor();
+    compressorNode.threshold.value = this.effects.compressor.threshold;
+    compressorNode.ratio.value = this.effects.compressor.ratio;
+    compressorNode.attack.value = this.effects.compressor.attack;
+    compressorNode.release.value = this.effects.compressor.release;
+    compressorNode.knee.value = this.effects.compressor.knee;
+
+    const volumeNode = offlineCtx.createGain();
+    volumeNode.gain.value = this.effects.volume;
+
+    // Connect effects chain
+    hpNode.connect(lpNode);
+    lpNode.connect(bassNode);
+    bassNode.connect(trebleNode);
+
+    let lastMasterNode: AudioNode = trebleNode;
+    eqNodes.forEach(node => {
+      lastMasterNode.connect(node);
+      lastMasterNode = node;
+    });
+    lastMasterNode.connect(distortionNode);
     
-    const source = offlineCtx.createBufferSource();
-    source.buffer = this.buffer;
-    source.playbackRate.value = this.effects.speed;
-    source.detune.value = this.effects.pitch * 100;
+    distortionNode.connect(pannerNode);
     
-    const volume = offlineCtx.createGain();
-    volume.gain.value = this.effects.volume;
+    distortionNode.connect(delayNode);
+    delayNode.connect(delayMix);
+    delayMix.connect(pannerNode);
     
-    source.connect(volume);
-    volume.connect(offlineCtx.destination);
+    distortionNode.connect(reverbNode);
+    reverbNode.connect(reverbMix);
+    reverbMix.connect(pannerNode);
     
-    source.start(0);
+    pannerNode.connect(compressorNode);
+    compressorNode.connect(volumeNode);
+    volumeNode.connect(offlineCtx.destination);
+
+    // Route and start main editor track source
+    if (this.buffer) {
+      const source = offlineCtx.createBufferSource();
+      source.buffer = this.buffer;
+      source.playbackRate.value = this.effects.speed;
+      source.detune.value = this.effects.pitch * 100;
+      source.connect(hpNode);
+      source.start(0);
+    }
+
+    // Route and start multi-track mixer sources
+    const hasSolo = this.tracks.some(t => t.solo);
+    this.tracks.forEach(track => {
+      const sourceNode = offlineCtx.createBufferSource();
+      sourceNode.buffer = track.buffer;
+
+      const gainNode = offlineCtx.createGain();
+      if (hasSolo) {
+        gainNode.gain.value = track.solo && !track.muted ? track.volume : 0;
+      } else {
+        gainNode.gain.value = track.muted ? 0 : track.volume;
+      }
+
+      const pannerNode = offlineCtx.createStereoPanner();
+      pannerNode.pan.value = track.pan;
+
+      sourceNode.connect(gainNode);
+      gainNode.connect(pannerNode);
+      pannerNode.connect(compressorNode); // Connect to compressor matching real-time path
+
+      sourceNode.start(0);
+    });
+
     const renderedBuffer = await offlineCtx.startRendering();
     return audioBufferToWav(renderedBuffer);
   }

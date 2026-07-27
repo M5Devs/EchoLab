@@ -43,6 +43,7 @@ type FirebaseContextType = {
   cloudProjects: CloudProject[];
   cloudLoading: boolean;
 
+  login: () => Promise<void>;
   loginWithGoogle: () => Promise<void>;
   loginWithGithub: () => Promise<void>;
   loginWithEmail: (email: string, password: string) => Promise<void>;
@@ -222,6 +223,7 @@ export function FirebaseProvider({ children }: { children: React.ReactNode }) {
         isAnonymous: user?.isAnonymous ?? false,
         cloudProjects,
         cloudLoading,
+        login: loginWithGoogle,
         loginWithGoogle,
         loginWithGithub,
         loginWithEmail,
