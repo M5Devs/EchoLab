@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react';
 import { AudioEngine, AudioEffects, defaultEffects, Track as EngineTrack, LoudnessData } from '../utils/AudioEngine';
 import { parseBlob } from 'music-metadata';
+import { toast } from 'sonner';
 
 export type Track = {
   id: string;
@@ -42,6 +43,8 @@ type AudioContextType = {
   stop: () => void;
   seek: (time: number) => void;
   loadTrack: (track: Track) => Promise<void>;
+  playNextTrack: () => Promise<void>;
+  playPreviousTrack: () => Promise<void>;
   updateEffects: (effects: Partial<AudioEffects>) => void;
   updateMetadata: (updates: Partial<Track>) => void;
   exportWav: () => Promise<Blob>;
@@ -116,46 +119,20 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
     setRedoCount(eng.historyStack.length - 1 - eng.historyIndex);
   }, []);
 
-  useEffect(() => {
-    const engine = engineRef.current;
-    engine.onEnded = updateState;
-    engine.onStateChange = updateState;
-    
-    engine.listProjects().then(setProjects);
-
-    return () => {
-      engine.stop();
-    };
-  }, [updateState]);
-
-  useEffect(() => {
-    localStorage.setItem('echolab_playlists', JSON.stringify(playlists));
-  }, [playlists]);
-
-  const togglePlay = () => {
-    const engine = engineRef.current;
-    if (engine.isPlaying) {
-      engine.pause();
-    } else {
-      engine.play();
-    }
-  };
-
-  const stop = () => {
+  const stop = useCallback(() => {
     engineRef.current.stop();
-  };
+  }, []);
 
-  const seek = (time: number) => {
-    engineRef.current.seek(time);
-  };
-
-  const loadTrack = async (track: Track) => {
+  const loadTrack = useCallback(async (track: Track) => {
     const engine = engineRef.current;
     setIsLoaded(false);
     stop();
     
     try {
       if (track.file) {
+        if (!track.file.arrayBuffer) {
+          throw new Error("Local file reference is missing. Please re-upload or select a new track.");
+        }
         const arrayBuffer = await track.file.arrayBuffer();
         await engine.loadBuffer(arrayBuffer);
         
@@ -178,14 +155,105 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
         }
       } else if (track.url) {
         await engine.loadUrl(track.url);
+      } else {
+        throw new Error("Track has no file or URL data to stream.");
       }
       
       track.duration = engine.getDuration();
-      setCurrentTrack({ ...track });
+      const updatedTrack = { ...track };
+      setCurrentTrack(updatedTrack);
+
+      // Auto add track to active playlist if not already there
+      if (activePlaylistId) {
+        setPlaylists(prev => prev.map(p => {
+          if (p.id === activePlaylistId) {
+            const exists = p.tracks.some(t => t.id === updatedTrack.id || (updatedTrack.name && t.name === updatedTrack.name));
+            if (!exists) {
+              return { ...p, tracks: [...p.tracks, updatedTrack] };
+            }
+          }
+          return p;
+        }));
+      }
+
       engine.play();
-    } catch (err) {
+    } catch (err: any) {
       console.error("Failed to load track:", err);
+      toast.error(err.message || "Failed to load track");
+      setIsLoaded(!!engine.buffer);
     }
+  }, [activePlaylistId, stop]);
+
+  const playNextTrack = useCallback(async () => {
+    if (!activePlaylistId || !currentTrack) return;
+    const activePlaylist = playlists.find(p => p.id === activePlaylistId);
+    if (!activePlaylist || activePlaylist.tracks.length === 0) return;
+
+    const currentIndex = activePlaylist.tracks.findIndex(t => t.id === currentTrack.id);
+    if (currentIndex === -1) return;
+
+    const nextIndex = (currentIndex + 1) % activePlaylist.tracks.length;
+    const nextTrack = activePlaylist.tracks[nextIndex];
+    await loadTrack(nextTrack);
+  }, [activePlaylistId, currentTrack, playlists, loadTrack]);
+
+  const playPreviousTrack = useCallback(async () => {
+    if (!activePlaylistId || !currentTrack) return;
+    const activePlaylist = playlists.find(p => p.id === activePlaylistId);
+    if (!activePlaylist || activePlaylist.tracks.length === 0) return;
+
+    const currentIndex = activePlaylist.tracks.findIndex(t => t.id === currentTrack.id);
+    if (currentIndex === -1) return;
+
+    const prevIndex = (currentIndex - 1 + activePlaylist.tracks.length) % activePlaylist.tracks.length;
+    const prevTrack = activePlaylist.tracks[prevIndex];
+    await loadTrack(prevTrack);
+  }, [activePlaylistId, currentTrack, playlists, loadTrack]);
+
+  useEffect(() => {
+    const engine = engineRef.current;
+
+    const handleEnded = () => {
+      updateState();
+
+      // Auto play next track if there is an active playlist and we have a next track
+      if (activePlaylistId && currentTrack) {
+        const activePlaylist = playlists.find(p => p.id === activePlaylistId);
+        if (activePlaylist && activePlaylist.tracks.length > 0) {
+          const currentIndex = activePlaylist.tracks.findIndex(t => t.id === currentTrack.id);
+          if (currentIndex !== -1 && currentIndex < activePlaylist.tracks.length - 1) {
+            const nextTrack = activePlaylist.tracks[currentIndex + 1];
+            loadTrack(nextTrack);
+          }
+        }
+      }
+    };
+
+    engine.onEnded = handleEnded;
+    engine.onStateChange = updateState;
+
+    engine.listProjects().then(setProjects);
+
+    return () => {
+      engine.stop();
+    };
+  }, [updateState, activePlaylistId, currentTrack, playlists, loadTrack]);
+
+  useEffect(() => {
+    localStorage.setItem('echolab_playlists', JSON.stringify(playlists));
+  }, [playlists]);
+
+  const togglePlay = () => {
+    const engine = engineRef.current;
+    if (engine.isPlaying) {
+      engine.pause();
+    } else {
+      engine.play();
+    }
+  };
+
+  const seek = (time: number) => {
+    engineRef.current.seek(time);
   };
 
   const updateEffects = (newEffects: Partial<AudioEffects>) => {
@@ -308,7 +376,7 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
       engine: engineRef.current,
       isPlaying, isLoaded, currentTrack, effects, playlists, activePlaylistId,
       tracks, isRecording, undoCount, redoCount, projects, loudnessData, bpm,
-      togglePlay, stop, seek, loadTrack, updateEffects, updateMetadata, exportWav, exportMp3,
+      togglePlay, stop, seek, loadTrack, playNextTrack, playPreviousTrack, updateEffects, updateMetadata, exportWav, exportMp3,
       createPlaylist, addTrackToPlaylist, removeTrackFromPlaylist, reorderPlaylist, setActivePlaylist: setActivePlaylistId,
       undo, redo, trim, reverse, normalize, setLoopRegion, clearLoop,
       addMixerTrack, removeMixerTrack, setTrackGain, setTrackPan, muteTrack, soloTrack,
