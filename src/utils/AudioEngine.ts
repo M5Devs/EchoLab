@@ -961,9 +961,10 @@ export class AudioEngine {
       ? await this.timeStretchBuffer(this.buffer, speed)
       : null;
 
-    const stretchedDur = sourceBuffer ? sourceBuffer.duration : maxDur;
-    const tail         = (this.effects.reverb > 0 ? 3 : 0) + (this.effects.delay > 0 ? 2 : 0);
-    const totalSamples = Math.ceil((stretchedDur + tail) * sr);
+    // Use buffer.length directly — don't trust .duration which depends on declared sampleRate
+    const stretchedSamples = sourceBuffer ? sourceBuffer.length : Math.ceil(maxDur * sr);
+    const tailSamples      = ((this.effects.reverb > 0 ? 3 : 0) + (this.effects.delay > 0 ? 2 : 0)) * sr;
+    const totalSamples     = stretchedSamples + Math.ceil(tailSamples);
 
     const offlineCtx = new (window.OfflineAudioContext || (window as any).webkitOfflineAudioContext)(
       2,
