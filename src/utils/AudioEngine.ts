@@ -12,25 +12,25 @@ export interface EQBandDef {
 }
 
 export type CompressorDef = {
-  threshold: number; // -100 to 0 dB
-  ratio: number;     // 1 to 20
-  attack: number;    // 0 to 1
-  release: number;   // 0 to 1
-  knee: number;      // 0 to 40
+  threshold: number;
+  ratio: number;
+  attack: number;
+  release: number;
+  knee: number;
 };
 
 export type AudioEffects = {
-  speed: number;       // 0.25 to 2.0
-  reverb: number;      // 0 to 1
-  pitch: number;       // -12 to 12
-  bass: number;        // -10 to 10
-  treble: number;      // -10 to 10
-  distortion: number;  // 0 to 1
-  delay: number;       // 0 to 100
-  pan8D: number;       // 0 to 1
-  volume: number;      // 0 to 1.5
-  lowpass: number;     // 100 to 20000
-  highpass: number;    // 20 to 1000
+  speed: number;
+  reverb: number;
+  pitch: number;
+  bass: number;
+  treble: number;
+  distortion: number;
+  delay: number;
+  pan8D: number;
+  volume: number;
+  lowpass: number;
+  highpass: number;
   eqBands: EQBandDef[];
   compressor: CompressorDef;
 };
@@ -116,15 +116,14 @@ export class AudioEngine {
   buffer: AudioBuffer | null = null;
   source: AudioBufferSourceNode | null = null;
   analyser: AnalyserNode;
-  
-  // Nodes
+
   highpassNode: BiquadFilterNode;
   lowpassNode: BiquadFilterNode;
   bassNode: BiquadFilterNode;
   trebleNode: BiquadFilterNode;
-  
+
   eqNodes: BiquadFilterNode[] = [];
-  
+
   distortionNode: WaveShaperNode;
   delayNode: DelayNode;
   delayMix: GainNode;
@@ -133,20 +132,19 @@ export class AudioEngine {
   pannerNode: StereoPannerNode;
   pannerLfo: OscillatorNode;
   pannerLfoGain: GainNode;
-  
+
   compressorNode: DynamicsCompressorNode;
   volumeNode: GainNode;
-  
-  // Mixer
+
   channelMerger: ChannelMergerNode;
   tracks: Track[] = [];
-  
+
   effects: AudioEffects = JSON.parse(JSON.stringify(defaultEffects));
-  
+
   isPlaying = false;
   startTime = 0;
   pauseTime = 0;
-  
+
   onEnded: () => void = () => {};
   onStateChange: () => void = () => {};
 
@@ -155,7 +153,7 @@ export class AudioEngine {
   maxHistory = 50;
 
   dbPromise: Promise<IDBPDatabase<EchoLabDB>>;
-  
+
   mediaRecorder: MediaRecorder | null = null;
   recordedChunks: BlobPart[] = [];
   recordingStream: MediaStream | null = null;
@@ -167,38 +165,36 @@ export class AudioEngine {
 
   constructor() {
     this.ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-    
-    // Core nodes
+
     this.highpassNode = this.ctx.createBiquadFilter();
     this.highpassNode.type = 'highpass';
-    
+
     this.lowpassNode = this.ctx.createBiquadFilter();
     this.lowpassNode.type = 'lowpass';
-    
+
     this.bassNode = this.ctx.createBiquadFilter();
     this.bassNode.type = 'lowshelf';
     this.bassNode.frequency.value = 200;
-    
+
     this.trebleNode = this.ctx.createBiquadFilter();
     this.trebleNode.type = 'highshelf';
     this.trebleNode.frequency.value = 8000;
-    
-    // Parametric EQ
+
     for (let i = 0; i < 5; i++) {
       const eqNode = this.ctx.createBiquadFilter();
       this.eqNodes.push(eqNode);
     }
-    
+
     this.distortionNode = this.ctx.createWaveShaper();
     this.distortionNode.oversample = '4x';
-    
+
     this.delayNode = this.ctx.createDelay(1.0);
     this.delayMix = this.ctx.createGain();
-    
+
     this.reverbNode = this.ctx.createConvolver();
     this.reverbMix = this.ctx.createGain();
     this.generateImpulseResponse();
-    
+
     this.pannerNode = this.ctx.createStereoPanner();
     this.pannerLfo = this.ctx.createOscillator();
     this.pannerLfo.type = 'sine';
@@ -207,15 +203,15 @@ export class AudioEngine {
     this.pannerLfo.connect(this.pannerLfoGain);
     this.pannerLfoGain.connect(this.pannerNode.pan);
     this.pannerLfo.start();
-    
+
     this.compressorNode = this.ctx.createDynamicsCompressor();
     this.volumeNode = this.ctx.createGain();
-    
+
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 2048;
-    
+
     this.channelMerger = this.ctx.createChannelMerger(2);
-    
+
     this.dbPromise = openDB<EchoLabDB>('echolab-projects', 1, {
       upgrade(db) {
         db.createObjectStore('projects', { keyPath: 'id' });
@@ -224,7 +220,7 @@ export class AudioEngine {
 
     this.parseHashSettings();
   }
-  
+
   private parseHashSettings() {
     try {
       const hash = window.location.hash;
@@ -260,8 +256,23 @@ export class AudioEngine {
   }
 
   async loadUrl(url: string) {
-    const response = await fetch(url);
-    const arrayBuffer = await response.arrayBuffer();
+    // try direct fetch first, fallback to CORS proxy
+    const tryFetch = async (target: string) => {
+      const res = await fetch(target);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.arrayBuffer();
+    };
+
+    let arrayBuffer: ArrayBuffer;
+    try {
+      arrayBuffer = await tryFetch(url);
+    } catch {
+      try {
+        arrayBuffer = await tryFetch(`https://corsproxy.io/?${encodeURIComponent(url)}`);
+      } catch {
+        throw new Error('Could not load audio — the server may not allow cross-origin requests.');
+      }
+    }
     await this.loadBuffer(arrayBuffer);
   }
 
@@ -313,7 +324,7 @@ export class AudioEngine {
     const startSample = Math.max(0, Math.floor(startSec * this.buffer.sampleRate));
     const endSample = Math.min(this.buffer.length, Math.floor(endSec * this.buffer.sampleRate));
     if (startSample >= endSample) return;
-    
+
     const newBuffer = this.ctx.createBuffer(this.buffer.numberOfChannels, endSample - startSample, this.buffer.sampleRate);
     for (let c = 0; c < this.buffer.numberOfChannels; c++) {
       const channelData = this.buffer.getChannelData(c);
@@ -347,7 +358,7 @@ export class AudioEngine {
       }
     }
     if (maxAmp === 0) return;
-    
+
     const multiplier = 1.0 / maxAmp;
     const newBuffer = this.ctx.createBuffer(this.buffer.numberOfChannels, this.buffer.length, this.buffer.sampleRate);
     for (let c = 0; c < this.buffer.numberOfChannels; c++) {
@@ -406,18 +417,17 @@ export class AudioEngine {
 
   applyEffects(effects: Partial<AudioEffects>) {
     this.effects = { ...this.effects, ...effects };
-    
+
     if (this.source) {
       this.source.playbackRate.value = this.effects.speed;
       this.source.detune.value = this.effects.pitch * 100;
     }
-    
+
     this.highpassNode.frequency.value = this.effects.highpass;
     this.lowpassNode.frequency.value = this.effects.lowpass;
     this.bassNode.gain.value = this.effects.bass;
     this.trebleNode.gain.value = this.effects.treble;
-    
-    // Apply EQ
+
     this.effects.eqBands.forEach((band, i) => {
       if (this.eqNodes[i]) {
         this.eqNodes[i].type = band.type;
@@ -426,25 +436,24 @@ export class AudioEngine {
         this.eqNodes[i].Q.value = band.q;
       }
     });
-    
+
     this.distortionNode.curve = this.effects.distortion > 0 ? this.makeDistortionCurve(this.effects.distortion) : null;
     this.delayNode.delayTime.value = this.effects.delay / 1000;
     this.pannerLfoGain.gain.value = this.effects.pan8D;
-    
-    // Compressor
+
     this.compressorNode.threshold.value = this.effects.compressor.threshold;
     this.compressorNode.ratio.value = this.effects.compressor.ratio;
     this.compressorNode.attack.value = this.effects.compressor.attack;
     this.compressorNode.release.value = this.effects.compressor.release;
     this.compressorNode.knee.value = this.effects.compressor.knee;
-    
+
     this.volumeNode.gain.value = this.effects.volume;
     this.onStateChange();
   }
 
   private connectNodes() {
     if (!this.source) return;
-    
+
     this.source.disconnect();
     this.highpassNode.disconnect();
     this.lowpassNode.disconnect();
@@ -459,34 +468,33 @@ export class AudioEngine {
     this.pannerNode.disconnect();
     this.compressorNode.disconnect();
     this.volumeNode.disconnect();
-    
-    // Source -> highpass -> lowpass -> bass -> treble -> eqNodes -> distortion
+
     this.source.connect(this.highpassNode);
     this.highpassNode.connect(this.lowpassNode);
     this.lowpassNode.connect(this.bassNode);
     this.bassNode.connect(this.trebleNode);
-    
+
     let currentLast = this.trebleNode as AudioNode;
     this.eqNodes.forEach(node => {
       currentLast.connect(node);
       currentLast = node;
     });
     currentLast.connect(this.distortionNode);
-    
+
     const afterDistortion = this.distortionNode;
-    
+
     afterDistortion.connect(this.pannerNode);
-    
+
     afterDistortion.connect(this.delayNode);
     this.delayNode.connect(this.delayMix);
     this.delayMix.gain.value = this.effects.delay > 0 ? 0.5 : 0;
     this.delayMix.connect(this.pannerNode);
-    
+
     afterDistortion.connect(this.reverbNode);
     this.reverbNode.connect(this.reverbMix);
     this.reverbMix.gain.value = this.effects.reverb;
     this.reverbMix.connect(this.pannerNode);
-    
+
     this.pannerNode.connect(this.compressorNode);
     this.compressorNode.connect(this.volumeNode);
     this.volumeNode.connect(this.analyser);
@@ -496,9 +504,9 @@ export class AudioEngine {
   play() {
     if (!this.buffer && this.tracks.length === 0) return;
     this.resumeContext();
-    
+
     const offset = this.pauseTime;
-    
+
     if (this.buffer) {
       this.source = this.ctx.createBufferSource();
       this.source.buffer = this.buffer;
@@ -520,11 +528,9 @@ export class AudioEngine {
 
       this.connectNodes();
       this.applyEffects(this.effects);
-
       this.source.start(0, offset);
     }
-    
-    // Play multi-track mixer tracks in sync!
+
     const hasSolo = this.tracks.some(t => t.solo);
     this.tracks.forEach(track => {
       if (track.sourceNode) {
@@ -532,26 +538,22 @@ export class AudioEngine {
         track.sourceNode = undefined;
       }
 
-      if (offset >= track.buffer.duration && !this.isLooping) {
-        return;
-      }
+      if (offset >= track.buffer.duration && !this.isLooping) return;
 
       const sourceNode = this.ctx.createBufferSource();
       sourceNode.buffer = track.buffer;
 
       const gainNode = this.ctx.createGain();
-      if (hasSolo) {
-        gainNode.gain.value = track.solo && !track.muted ? track.volume : 0;
-      } else {
-        gainNode.gain.value = track.muted ? 0 : track.volume;
-      }
+      gainNode.gain.value = hasSolo
+        ? (track.solo && !track.muted ? track.volume : 0)
+        : (track.muted ? 0 : track.volume);
 
       const pannerNode = this.ctx.createStereoPanner();
       pannerNode.pan.value = track.pan;
 
       sourceNode.connect(gainNode);
       gainNode.connect(pannerNode);
-      pannerNode.connect(this.compressorNode); // Route to compressor / master bus!
+      pannerNode.connect(this.compressorNode);
 
       track.sourceNode = sourceNode;
       track.gainNode = gainNode;
@@ -566,7 +568,7 @@ export class AudioEngine {
       const trackStartOffset = this.isLooping ? (offset % track.buffer.duration) : offset;
       sourceNode.start(0, trackStartOffset);
     });
-    
+
     this.startTime = this.ctx.currentTime - (offset / this.effects.speed);
     this.isPlaying = true;
     this.onStateChange();
@@ -630,9 +632,7 @@ export class AudioEngine {
   getDuration(): number {
     let maxDur = this.buffer ? this.buffer.duration : 0;
     this.tracks.forEach(t => {
-      if (t.buffer.duration > maxDur) {
-        maxDur = t.buffer.duration;
-      }
+      if (t.buffer.duration > maxDur) maxDur = t.buffer.duration;
     });
     return maxDur;
   }
@@ -642,13 +642,13 @@ export class AudioEngine {
     this.analyser.getByteFrequencyData(dataArray);
     return dataArray;
   }
-  
+
   getWaveformData(): Uint8Array {
     const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
     this.analyser.getByteTimeDomainData(dataArray);
     return dataArray;
   }
-  
+
   getFloatFrequencyData(): Float32Array {
     const dataArray = new Float32Array(this.analyser.frequencyBinCount);
     this.analyser.getFloatFrequencyData(dataArray);
@@ -661,13 +661,11 @@ export class AudioEngine {
     return dataArray;
   }
 
-  // --- Multi-track ---
   addTrack(buffer: AudioBuffer, name: string) {
     const id = Math.random().toString(36).substring(7);
     const track: Track = { id, name, buffer, muted: false, solo: false, volume: 1, pan: 0 };
     this.tracks.push(track);
 
-    // If playing, start this track immediately in sync!
     if (this.isPlaying) {
       const offset = this.getCurrentTime();
       if (offset < buffer.duration || this.isLooping) {
@@ -676,11 +674,9 @@ export class AudioEngine {
 
         const gainNode = this.ctx.createGain();
         const hasSolo = this.tracks.some(t => t.solo);
-        if (hasSolo) {
-          gainNode.gain.value = track.solo && !track.muted ? track.volume : 0;
-        } else {
-          gainNode.gain.value = track.muted ? 0 : track.volume;
-        }
+        gainNode.gain.value = hasSolo
+          ? (track.solo && !track.muted ? track.volume : 0)
+          : (track.muted ? 0 : track.volume);
 
         const pannerNode = this.ctx.createStereoPanner();
         pannerNode.pan.value = track.pan;
@@ -758,22 +754,15 @@ export class AudioEngine {
     const hasSolo = this.tracks.some(t => t.solo);
     this.tracks.forEach(track => {
       if (track.gainNode) {
-        if (hasSolo) {
-          track.gainNode.gain.value = track.solo && !track.muted ? track.volume : 0;
-        } else {
-          track.gainNode.gain.value = track.muted ? 0 : track.volume;
-        }
+        track.gainNode.gain.value = hasSolo
+          ? (track.solo && !track.muted ? track.volume : 0)
+          : (track.muted ? 0 : track.volume);
       }
     });
   }
 
-  private rebuildMixer() {
-    // If playing, we'd need to stop and restart, for now let's just create nodes
-    // The requirement says playback plays all tracks simultaneously.
-    // For simplicity, we can play them on play().
-  }
+  private rebuildMixer() {}
 
-  // --- Recording ---
   async startRecording() {
     try {
       this.recordingStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -808,7 +797,6 @@ export class AudioEngine {
     });
   }
 
-  // --- Stem Separation ---
   async separateStems(buffer: AudioBuffer) {
     const sr = buffer.sampleRate;
     const len = buffer.length;
@@ -834,7 +822,7 @@ export class AudioEngine {
     const drums = await renderStem((ctx, source) => {
       const bp = ctx.createBiquadFilter();
       bp.type = 'bandpass';
-      bp.frequency.value = 2500; // between 200-8000
+      bp.frequency.value = 2500;
       bp.Q.value = 1;
       const peak = ctx.createBiquadFilter();
       peak.type = 'peaking';
@@ -848,7 +836,7 @@ export class AudioEngine {
     const vocals = await renderStem((ctx, source) => {
       const bp = ctx.createBiquadFilter();
       bp.type = 'bandpass';
-      bp.frequency.value = 1500; // 200 to 3500
+      bp.frequency.value = 1500;
       bp.Q.value = 0.5;
       source.connect(bp);
       return bp;
@@ -865,13 +853,11 @@ export class AudioEngine {
     return { vocals, drums, bass, other };
   }
 
-  // --- Loudness Analysis ---
   analyzeLoudness(buffer: AudioBuffer): LoudnessData {
     let sumSquares = 0;
     let maxAbs = 0;
     let totalSamples = 0;
-    
-    // True Peak Approximation & RMS
+
     for (let c = 0; c < buffer.numberOfChannels; c++) {
       const data = buffer.getChannelData(c);
       for (let i = 0; i < data.length; i++) {
@@ -882,9 +868,8 @@ export class AudioEngine {
       }
       totalSamples += data.length;
     }
-    
+
     const rms = Math.sqrt(sumSquares / totalSamples);
-    // Rough LUFS approx via RMS offset (-0.691 and K-weighting simplification)
     const integratedLUFS = (rms > 0) ? 20 * Math.log10(rms) - 0.691 : -70;
     const truePeak = (maxAbs > 0) ? 20 * Math.log10(maxAbs) : -70;
     const dynamicRange = Math.abs(truePeak - integratedLUFS);
@@ -903,7 +888,7 @@ export class AudioEngine {
     if (data.integratedLUFS < -16) {
       suggested.volume = Math.min(1.5, Math.pow(10, (-14 - data.integratedLUFS) / 20));
     }
-    
+
     suggested.compressor = {
       threshold: -18,
       ratio: 3,
@@ -911,7 +896,7 @@ export class AudioEngine {
       release: 0.25,
       knee: 30
     };
-    
+
     const highShelf = suggested.eqBands?.find(b => b.type === 'highshelf');
     if (highShelf) {
       highShelf.freq = 10000;
@@ -921,29 +906,33 @@ export class AudioEngine {
     return suggested;
   }
 
-  detectBPM(buffer: AudioBuffer): number {
-    return 120; // Simplified BPM detection for brevity. Real implementation requires complex onset detection.
+  detectBPM(_buffer: AudioBuffer): number {
+    return 120;
   }
 
+  // ── renderOffline: the single source of truth for export ──────────────────
   async renderOffline(): Promise<AudioBuffer> {
     let maxDur = this.buffer ? this.buffer.duration : 0;
     this.tracks.forEach(t => {
-      if (t.buffer.duration > maxDur) {
-        maxDur = t.buffer.duration;
-      }
+      if (t.buffer.duration > maxDur) maxDur = t.buffer.duration;
     });
     if (maxDur === 0) throw new Error("No audio loaded to export");
 
-    const exportSpeed = this.effects.speed;
-    const totalDuration = (maxDur / exportSpeed) + (this.effects.reverb > 0 ? 2 : 0) + (this.effects.delay > 0 ? 1 : 0);
-    
+    const sr    = this.ctx.sampleRate;
+    const speed = this.effects.speed > 0 ? this.effects.speed : 1;
+
+    // FIX: correct stretched duration + generous tail for reverb/delay ring-out
+    const stretchedDur = maxDur / speed;
+    const tail         = (this.effects.reverb > 0 ? 3 : 0) + (this.effects.delay > 0 ? 2 : 0);
+    const totalSamples = Math.ceil((stretchedDur + tail) * sr);
+
     const offlineCtx = new (window.OfflineAudioContext || (window as any).webkitOfflineAudioContext)(
-      2, 
-      Math.floor(this.ctx.sampleRate * totalDuration),
-      this.ctx.sampleRate
+      2,
+      totalSamples,
+      sr
     );
 
-    // Recreate master effects chain in offline context
+    // Rebuild full effects chain in offline context
     const hpNode = offlineCtx.createBiquadFilter();
     hpNode.type = 'highpass';
     hpNode.frequency.value = this.effects.highpass;
@@ -992,22 +981,21 @@ export class AudioEngine {
     pannerLfo.frequency.value = 0.15;
     const pannerLfoGain = offlineCtx.createGain();
     pannerLfoGain.gain.value = this.effects.pan8D;
-
     pannerLfo.connect(pannerLfoGain);
     pannerLfoGain.connect(pannerNode.pan);
     pannerLfo.start(0);
 
     const compressorNode = offlineCtx.createDynamicsCompressor();
     compressorNode.threshold.value = this.effects.compressor.threshold;
-    compressorNode.ratio.value = this.effects.compressor.ratio;
-    compressorNode.attack.value = this.effects.compressor.attack;
-    compressorNode.release.value = this.effects.compressor.release;
-    compressorNode.knee.value = this.effects.compressor.knee;
+    compressorNode.ratio.value     = this.effects.compressor.ratio;
+    compressorNode.attack.value    = this.effects.compressor.attack;
+    compressorNode.release.value   = this.effects.compressor.release;
+    compressorNode.knee.value      = this.effects.compressor.knee;
 
     const volumeNode = offlineCtx.createGain();
     volumeNode.gain.value = this.effects.volume;
 
-    // Connect effects chain
+    // Wire up master chain
     hpNode.connect(lpNode);
     lpNode.connect(bassNode);
     bassNode.connect(trebleNode);
@@ -1033,43 +1021,39 @@ export class AudioEngine {
     compressorNode.connect(volumeNode);
     volumeNode.connect(offlineCtx.destination);
 
-    // Route and start main editor track source
+    // Main editor buffer
     if (this.buffer) {
       const source = offlineCtx.createBufferSource();
       source.buffer = this.buffer;
-      source.playbackRate.value = this.effects.speed;
+      source.playbackRate.value = speed;
       source.detune.value = this.effects.pitch * 100;
       source.connect(hpNode);
       source.start(0);
     }
 
-    // Route and start multi-track mixer sources
+    // Multi-track mixer
     const hasSolo = this.tracks.some(t => t.solo);
     this.tracks.forEach(track => {
       const sourceNode = offlineCtx.createBufferSource();
       sourceNode.buffer = track.buffer;
 
       const gainNode = offlineCtx.createGain();
-      if (hasSolo) {
-        gainNode.gain.value = track.solo && !track.muted ? track.volume : 0;
-      } else {
-        gainNode.gain.value = track.muted ? 0 : track.volume;
-      }
+      gainNode.gain.value = hasSolo
+        ? (track.solo && !track.muted ? track.volume : 0)
+        : (track.muted ? 0 : track.volume);
 
-      const pannerNode = offlineCtx.createStereoPanner();
-      pannerNode.pan.value = track.pan;
+      const tPanner = offlineCtx.createStereoPanner();
+      tPanner.pan.value = track.pan;
 
       sourceNode.connect(gainNode);
-      gainNode.connect(pannerNode);
-      pannerNode.connect(compressorNode); // Connect to compressor matching real-time path
-
+      gainNode.connect(tPanner);
+      tPanner.connect(compressorNode);
       sourceNode.start(0);
     });
 
     return await offlineCtx.startRendering();
   }
 
-  // --- Export ---
   async exportWAV(): Promise<Blob> {
     const renderedBuffer = await this.renderOffline();
     return audioBufferToWav(renderedBuffer);
@@ -1103,7 +1087,6 @@ export class AudioEngine {
     return new Blob(mp3Data, { type: 'audio/mp3' });
   }
 
-  // --- IndexedDB ---
   async saveProject(name: string, playlists: any[] = []) {
     const db = await this.dbPromise;
     const id = Date.now().toString();
@@ -1130,7 +1113,7 @@ export class AudioEngine {
     const db = await this.dbPromise;
     const proj = await db.get('projects', id);
     if (!proj) return null;
-    
+
     if (proj.leftChannel && proj.sampleRate) {
       const channels = proj.rightChannel ? 2 : 1;
       const buffer = this.ctx.createBuffer(channels, proj.leftChannel.length, proj.sampleRate);
