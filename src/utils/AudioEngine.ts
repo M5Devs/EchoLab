@@ -910,6 +910,51 @@ export class AudioEngine {
     return 120;
   }
 
+  // ── Time-stretch via OfflineAudioContext resampling trick ─────────────────
+  // playbackRate in OfflineAudioContext changes pitch but NOT duration.
+  // Real time-stretching: resample buffer at (sampleRate * speed) → play at
+  // original sampleRate → duration becomes originalDuration / speed correctly.
+  private async timeStretchBuffer(buffer: AudioBuffer, speed: number): Promise<AudioBuffer> {
+    if (Math.abs(speed - 1.0) < 0.001) return buffer;
+
+    const sr = buffer.sampleRate;
+    const stretchedSamples = Math.ceil(buffer.length / speed);
+
+    // Step 1: render at fake sample rate to compress/expand
+    const fakeSr = Math.round(sr * speed);
+    const encodeCtx = new (window.OfflineAudioContext || (window as any).webkitOfflineAudioContext)(
+      buffer.numberOfChannels,
+      buffer.length,
+      fakeSr
+    );
+    const encSrc = encodeCtx.createBufferSource();
+    // create buffer with fakeSr so it plays at wrong rate
+    const fakeBuffer = encodeCtx.createBuffer(buffer.numberOfChannels, buffer.length, fakeSr);
+    for (let c = 0; c < buffer.numberOfChannels; c++) {
+      fakeBuffer.copyToChannel(buffer.getChannelData(c), c);
+    }
+    encSrc.buffer = fakeBuffer;
+    encSrc.connect(encodeCtx.destination);
+    encSrc.start(0);
+    const encoded = await encodeCtx.startRendering();
+
+    // Step 2: decode back at real sampleRate — duration is now originalDuration / speed
+    const decodeCtx = new (window.OfflineAudioContext || (window as any).webkitOfflineAudioContext)(
+      buffer.numberOfChannels,
+      stretchedSamples,
+      sr
+    );
+    const decSrc = decodeCtx.createBufferSource();
+    const realBuffer = decodeCtx.createBuffer(buffer.numberOfChannels, encoded.length, sr);
+    for (let c = 0; c < buffer.numberOfChannels; c++) {
+      realBuffer.copyToChannel(encoded.getChannelData(c), c);
+    }
+    decSrc.buffer = realBuffer;
+    decSrc.connect(decodeCtx.destination);
+    decSrc.start(0);
+    return await decodeCtx.startRendering();
+  }
+
   // ── renderOffline: the single source of truth for export ──────────────────
   async renderOffline(): Promise<AudioBuffer> {
     let maxDur = this.buffer ? this.buffer.duration : 0;
@@ -921,8 +966,12 @@ export class AudioEngine {
     const sr    = this.ctx.sampleRate;
     const speed = this.effects.speed > 0 ? this.effects.speed : 1;
 
-    // FIX: correct stretched duration + generous tail for reverb/delay ring-out
-    const stretchedDur = maxDur / speed;
+    // Pre-stretch the buffer before feeding to OfflineAudioContext
+    const sourceBuffer = this.buffer
+      ? await this.timeStretchBuffer(this.buffer, speed)
+      : null;
+
+    const stretchedDur = sourceBuffer ? sourceBuffer.duration : maxDur;
     const tail         = (this.effects.reverb > 0 ? 3 : 0) + (this.effects.delay > 0 ? 2 : 0);
     const totalSamples = Math.ceil((stretchedDur + tail) * sr);
 
@@ -1021,11 +1070,10 @@ export class AudioEngine {
     compressorNode.connect(volumeNode);
     volumeNode.connect(offlineCtx.destination);
 
-    // Main editor buffer
-    if (this.buffer) {
+    // Main editor buffer — already time-stretched, no playbackRate needed
+    if (sourceBuffer) {
       const source = offlineCtx.createBufferSource();
-      source.buffer = this.buffer;
-      source.playbackRate.value = speed;
+      source.buffer = sourceBuffer;
       source.detune.value = this.effects.pitch * 100;
       source.connect(hpNode);
       source.start(0);
