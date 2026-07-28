@@ -917,42 +917,33 @@ export class AudioEngine {
   private async timeStretchBuffer(buffer: AudioBuffer, speed: number): Promise<AudioBuffer> {
     if (Math.abs(speed - 1.0) < 0.001) return buffer;
 
-    const sr = buffer.sampleRate;
-    const stretchedSamples = Math.ceil(buffer.length / speed);
+    const sr             = buffer.sampleRate;
+    const stretchedLen   = Math.ceil(buffer.length / speed);
 
-    // Step 1: render at fake sample rate to compress/expand
-    const fakeSr = Math.round(sr * speed);
-    const encodeCtx = new (window.OfflineAudioContext || (window as any).webkitOfflineAudioContext)(
-      buffer.numberOfChannels,
-      buffer.length,
-      fakeSr
-    );
-    const encSrc = encodeCtx.createBufferSource();
-    // create buffer with fakeSr so it plays at wrong rate
-    const fakeBuffer = encodeCtx.createBuffer(buffer.numberOfChannels, buffer.length, fakeSr);
+    // Step 1: copy samples into a buffer declared at fakeSr
+    // When OfflineAudioContext renders it at real sr, it resamples → duration changes
+    const fakeSr    = Math.round(sr * speed);
+    const fakeBuffer = new (window.AudioContext || (window as any).webkitAudioContext)()
+      .createBuffer(buffer.numberOfChannels, buffer.length, fakeSr);
     for (let c = 0; c < buffer.numberOfChannels; c++) {
       fakeBuffer.copyToChannel(buffer.getChannelData(c), c);
     }
-    encSrc.buffer = fakeBuffer;
-    encSrc.connect(encodeCtx.destination);
-    encSrc.start(0);
-    const encoded = await encodeCtx.startRendering();
 
-    // Step 2: decode back at real sampleRate — duration is now originalDuration / speed
-    const decodeCtx = new (window.OfflineAudioContext || (window as any).webkitOfflineAudioContext)(
+    // Step 2: render at real sr with pitch compensation so only duration changes
+    // pitch shift caused by resampling = log2(speed) semitones → compensate with -detune
+    const pitchCompensationCents = -Math.round(Math.log2(speed) * 1200);
+
+    const offCtx = new (window.OfflineAudioContext || (window as any).webkitOfflineAudioContext)(
       buffer.numberOfChannels,
-      stretchedSamples,
+      stretchedLen,
       sr
     );
-    const decSrc = decodeCtx.createBufferSource();
-    const realBuffer = decodeCtx.createBuffer(buffer.numberOfChannels, encoded.length, sr);
-    for (let c = 0; c < buffer.numberOfChannels; c++) {
-      realBuffer.copyToChannel(encoded.getChannelData(c), c);
-    }
-    decSrc.buffer = realBuffer;
-    decSrc.connect(decodeCtx.destination);
-    decSrc.start(0);
-    return await decodeCtx.startRendering();
+    const src = offCtx.createBufferSource();
+    src.buffer = fakeBuffer;
+    src.detune.value = pitchCompensationCents;
+    src.connect(offCtx.destination);
+    src.start(0);
+    return await offCtx.startRendering();
   }
 
   // ── renderOffline: the single source of truth for export ──────────────────
