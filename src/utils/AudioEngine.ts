@@ -911,40 +911,6 @@ export class AudioEngine {
   }
 
   // ── Time-stretch via OfflineAudioContext resampling trick ─────────────────
-  // playbackRate in OfflineAudioContext changes pitch but NOT duration.
-  // Real time-stretching: resample buffer at (sampleRate * speed) → play at
-  // original sampleRate → duration becomes originalDuration / speed correctly.
-  private async timeStretchBuffer(buffer: AudioBuffer, speed: number): Promise<AudioBuffer> {
-    if (Math.abs(speed - 1.0) < 0.001) return buffer;
-
-    const sr           = buffer.sampleRate;
-    const stretchedLen = Math.ceil(buffer.length / speed);
-    const fakeSr       = Math.round(sr * speed);
-
-    // Copy samples into a buffer tagged with fakeSr — no pitch compensation here
-    const fakeBuffer = new OfflineAudioContext(1, 1, fakeSr)
-      .createBuffer(buffer.numberOfChannels, buffer.length, fakeSr);
-    for (let c = 0; c < buffer.numberOfChannels; c++) {
-      fakeBuffer.copyToChannel(buffer.getChannelData(c), c);
-    }
-
-    // Render at real sr WITH pitch compensation to undo the resampling artifact
-    // Then user pitch is applied separately in renderOffline via detune
-    const pitchCompCents = -Math.round(Math.log2(speed) * 1200);
-
-    const offCtx = new (window.OfflineAudioContext || (window as any).webkitOfflineAudioContext)(
-      buffer.numberOfChannels,
-      stretchedLen,
-      sr
-    );
-    const src = offCtx.createBufferSource();
-    src.buffer        = fakeBuffer;
-    src.detune.value  = pitchCompCents; // only compensates resampling, NOT user pitch
-    src.connect(offCtx.destination);
-    src.start(0);
-    return await offCtx.startRendering();
-  }
-
   // ── renderOffline: the single source of truth for export ──────────────────
   async renderOffline(): Promise<AudioBuffer> {
     let maxDur = this.buffer ? this.buffer.duration : 0;
@@ -956,13 +922,10 @@ export class AudioEngine {
     const sr    = this.ctx.sampleRate;
     const speed = this.effects.speed > 0 ? this.effects.speed : 1;
 
-    // Pre-stretch the buffer before feeding to OfflineAudioContext
-    const sourceBuffer = this.buffer
-      ? await this.timeStretchBuffer(this.buffer, speed)
-      : null;
-
-    // Use buffer.length directly — don't trust .duration which depends on declared sampleRate
-    const stretchedSamples = sourceBuffer ? sourceBuffer.length : Math.ceil(maxDur * sr);
+    // totalSamples = how long the rendered output will be in samples
+    // playbackRate slows/speeds the source but the OfflineAudioContext keeps rendering
+    // until its buffer is full — so we size it to the stretched duration
+    const stretchedSamples = Math.ceil((maxDur / speed) * sr);
     const tailSamples      = ((this.effects.reverb > 0 ? 3 : 0) + (this.effects.delay > 0 ? 2 : 0)) * sr;
     const totalSamples     = stretchedSamples + Math.ceil(tailSamples);
 
@@ -1061,16 +1024,12 @@ export class AudioEngine {
     compressorNode.connect(volumeNode);
     volumeNode.connect(offlineCtx.destination);
 
-    // Main editor buffer — already time-stretched, no playbackRate needed
-    if (sourceBuffer) {
+    // Main editor buffer
+    if (this.buffer) {
       const source = offlineCtx.createBufferSource();
-      source.buffer = sourceBuffer;
-      // timeStretchBuffer already applied pitchCompCents to cancel resampling artifact.
-      // We only need to add the user's own pitch on top — no double-counting.
-      const pitchCompAlreadyApplied = Math.abs(speed - 1.0) > 0.001
-        ? -Math.round(Math.log2(speed) * 1200)
-        : 0;
-      source.detune.value = (this.effects.pitch * 100) - pitchCompAlreadyApplied;
+      source.buffer = this.buffer;
+      source.playbackRate.value = speed;
+      source.detune.value = this.effects.pitch * 100;
       source.connect(hpNode);
       source.start(0);
     }
