@@ -1064,7 +1064,12 @@ export class AudioEngine {
     if (sourceBuffer) {
       const source = offlineCtx.createBufferSource();
       source.buffer = sourceBuffer;
-      source.detune.value = this.effects.pitch * 100;
+      // timeStretchBuffer already applied pitchCompCents to cancel resampling artifact.
+      // We only need to add the user's own pitch on top — no double-counting.
+      const pitchCompAlreadyApplied = Math.abs(speed - 1.0) > 0.001
+        ? -Math.round(Math.log2(speed) * 1200)
+        : 0;
+      source.detune.value = (this.effects.pitch * 100) - pitchCompAlreadyApplied;
       source.connect(hpNode);
       source.start(0);
     }
