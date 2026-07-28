@@ -925,8 +925,7 @@ export class AudioEngine {
     return 120; // Simplified BPM detection for brevity. Real implementation requires complex onset detection.
   }
 
-  // --- Export ---
-  async exportWAV(): Promise<Blob> {
+  async renderOffline(): Promise<AudioBuffer> {
     let maxDur = this.buffer ? this.buffer.duration : 0;
     this.tracks.forEach(t => {
       if (t.buffer.duration > maxDur) {
@@ -1019,17 +1018,17 @@ export class AudioEngine {
       lastMasterNode = node;
     });
     lastMasterNode.connect(distortionNode);
-    
+
     distortionNode.connect(pannerNode);
-    
+
     distortionNode.connect(delayNode);
     delayNode.connect(delayMix);
     delayMix.connect(pannerNode);
-    
+
     distortionNode.connect(reverbNode);
     reverbNode.connect(reverbMix);
     reverbMix.connect(pannerNode);
-    
+
     pannerNode.connect(compressorNode);
     compressorNode.connect(volumeNode);
     volumeNode.connect(offlineCtx.destination);
@@ -1067,7 +1066,12 @@ export class AudioEngine {
       sourceNode.start(0);
     });
 
-    const renderedBuffer = await offlineCtx.startRendering();
+    return await offlineCtx.startRendering();
+  }
+
+  // --- Export ---
+  async exportWAV(): Promise<Blob> {
+    const renderedBuffer = await this.renderOffline();
     return audioBufferToWav(renderedBuffer);
   }
 

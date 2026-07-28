@@ -38,6 +38,8 @@ type AudioContextType = {
   projects: any[];
   loudnessData: LoudnessData | null;
   bpm: number | null;
+  isShuffle: boolean;
+  isRepeat: boolean;
 
   togglePlay: () => void;
   stop: () => void;
@@ -45,10 +47,12 @@ type AudioContextType = {
   loadTrack: (track: Track) => Promise<void>;
   playNextTrack: () => Promise<void>;
   playPreviousTrack: () => Promise<void>;
+  toggleShuffle: () => void;
+  toggleRepeat: () => void;
   updateEffects: (effects: Partial<AudioEffects>) => void;
   updateMetadata: (updates: Partial<Track>) => void;
   exportWav: () => Promise<Blob>;
-  exportMp3: () => Blob | null;
+  exportMp3: () => Promise<Blob | null>;
   createPlaylist: (name: string) => void;
   addTrackToPlaylist: (playlistId: string, track: Track) => void;
   removeTrackFromPlaylist: (playlistId: string, trackId: string) => void;
@@ -99,6 +103,11 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
     return saved ? JSON.parse(saved) : [{ id: 'default', name: 'My Tracks', tracks: [] }];
   });
   const [activePlaylistId, setActivePlaylistId] = useState<string | null>('default');
+  const [isShuffle, setIsShuffle] = useState(false);
+  const [isRepeat, setIsRepeat] = useState(false);
+
+  const toggleShuffle = useCallback(() => setIsShuffle(prev => !prev), []);
+  const toggleRepeat = useCallback(() => setIsRepeat(prev => !prev), []);
 
   const [tracks, setTracks] = useState<EngineTrack[]>([]);
   const [isRecording, setIsRecording] = useState(false);
@@ -189,26 +198,50 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
     const activePlaylist = playlists.find(p => p.id === activePlaylistId);
     if (!activePlaylist || activePlaylist.tracks.length === 0) return;
 
-    const currentIndex = activePlaylist.tracks.findIndex(t => t.id === currentTrack.id);
-    if (currentIndex === -1) return;
+    let nextTrack: Track;
+    if (isShuffle && activePlaylist.tracks.length > 1) {
+      const otherTracks = activePlaylist.tracks.filter(t => t.id !== currentTrack.id);
+      nextTrack = otherTracks[Math.floor(Math.random() * otherTracks.length)];
+    } else {
+      const currentIndex = activePlaylist.tracks.findIndex(t => t.id === currentTrack.id);
+      if (currentIndex === -1) return;
 
-    const nextIndex = (currentIndex + 1) % activePlaylist.tracks.length;
-    const nextTrack = activePlaylist.tracks[nextIndex];
+      const nextIndex = currentIndex + 1;
+      if (nextIndex < activePlaylist.tracks.length) {
+        nextTrack = activePlaylist.tracks[nextIndex];
+      } else if (isRepeat) {
+        nextTrack = activePlaylist.tracks[0];
+      } else {
+        return;
+      }
+    }
     await loadTrack(nextTrack);
-  }, [activePlaylistId, currentTrack, playlists, loadTrack]);
+  }, [activePlaylistId, currentTrack, playlists, isShuffle, isRepeat, loadTrack]);
 
   const playPreviousTrack = useCallback(async () => {
     if (!activePlaylistId || !currentTrack) return;
     const activePlaylist = playlists.find(p => p.id === activePlaylistId);
     if (!activePlaylist || activePlaylist.tracks.length === 0) return;
 
-    const currentIndex = activePlaylist.tracks.findIndex(t => t.id === currentTrack.id);
-    if (currentIndex === -1) return;
+    let prevTrack: Track;
+    if (isShuffle && activePlaylist.tracks.length > 1) {
+      const otherTracks = activePlaylist.tracks.filter(t => t.id !== currentTrack.id);
+      prevTrack = otherTracks[Math.floor(Math.random() * otherTracks.length)];
+    } else {
+      const currentIndex = activePlaylist.tracks.findIndex(t => t.id === currentTrack.id);
+      if (currentIndex === -1) return;
 
-    const prevIndex = (currentIndex - 1 + activePlaylist.tracks.length) % activePlaylist.tracks.length;
-    const prevTrack = activePlaylist.tracks[prevIndex];
+      const prevIndex = currentIndex - 1;
+      if (prevIndex >= 0) {
+        prevTrack = activePlaylist.tracks[prevIndex];
+      } else if (isRepeat) {
+        prevTrack = activePlaylist.tracks[activePlaylist.tracks.length - 1];
+      } else {
+        return;
+      }
+    }
     await loadTrack(prevTrack);
-  }, [activePlaylistId, currentTrack, playlists, loadTrack]);
+  }, [activePlaylistId, currentTrack, playlists, isShuffle, isRepeat, loadTrack]);
 
   useEffect(() => {
     const engine = engineRef.current;
@@ -220,10 +253,22 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
       if (activePlaylistId && currentTrack) {
         const activePlaylist = playlists.find(p => p.id === activePlaylistId);
         if (activePlaylist && activePlaylist.tracks.length > 0) {
-          const currentIndex = activePlaylist.tracks.findIndex(t => t.id === currentTrack.id);
-          if (currentIndex !== -1 && currentIndex < activePlaylist.tracks.length - 1) {
-            const nextTrack = activePlaylist.tracks[currentIndex + 1];
+          if (isShuffle && activePlaylist.tracks.length > 1) {
+            const otherTracks = activePlaylist.tracks.filter(t => t.id !== currentTrack.id);
+            const nextTrack = otherTracks[Math.floor(Math.random() * otherTracks.length)];
             loadTrack(nextTrack);
+          } else {
+            const currentIndex = activePlaylist.tracks.findIndex(t => t.id === currentTrack.id);
+            if (currentIndex !== -1) {
+              const nextIndex = currentIndex + 1;
+              if (nextIndex < activePlaylist.tracks.length) {
+                const nextTrack = activePlaylist.tracks[nextIndex];
+                loadTrack(nextTrack);
+              } else if (isRepeat) {
+                const nextTrack = activePlaylist.tracks[0];
+                loadTrack(nextTrack);
+              }
+            }
           }
         }
       }
@@ -270,11 +315,12 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
     return engineRef.current.exportWAV();
   };
   
-  const exportMp3 = () => {
+  const exportMp3 = useCallback(async () => {
     const eng = engineRef.current;
-    if (!eng.buffer) return null;
-    return eng.exportMP3(eng.buffer, eng.buffer.sampleRate);
-  };
+    if (!eng.buffer && eng.tracks.length === 0) return null;
+    const renderedBuffer = await eng.renderOffline();
+    return eng.exportMP3(renderedBuffer, renderedBuffer.sampleRate);
+  }, []);
 
   const createPlaylist = (name: string) => {
     const newPlaylist: Playlist = {
@@ -375,8 +421,8 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
     <AudioContext.Provider value={{
       engine: engineRef.current,
       isPlaying, isLoaded, currentTrack, effects, playlists, activePlaylistId,
-      tracks, isRecording, undoCount, redoCount, projects, loudnessData, bpm,
-      togglePlay, stop, seek, loadTrack, playNextTrack, playPreviousTrack, updateEffects, updateMetadata, exportWav, exportMp3,
+      tracks, isRecording, undoCount, redoCount, projects, loudnessData, bpm, isShuffle, isRepeat,
+      togglePlay, stop, seek, loadTrack, playNextTrack, playPreviousTrack, toggleShuffle, toggleRepeat, updateEffects, updateMetadata, exportWav, exportMp3,
       createPlaylist, addTrackToPlaylist, removeTrackFromPlaylist, reorderPlaylist, setActivePlaylist: setActivePlaylistId,
       undo, redo, trim, reverse, normalize, setLoopRegion, clearLoop,
       addMixerTrack, removeMixerTrack, setTrackGain, setTrackPan, muteTrack, soloTrack,

@@ -14,7 +14,7 @@ export function ExportPanel() {
 
   const getBlob = async (): Promise<Blob | null> => {
     if (format === 'wav') return exportWav();
-    const mp3 = exportMp3();
+    const mp3 = await exportMp3();
     return mp3 ?? null;
   };
 

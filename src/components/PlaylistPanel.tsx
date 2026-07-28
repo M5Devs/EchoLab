@@ -1,9 +1,9 @@
 import { useState } from 'react';
 import { useAudio } from '../contexts/AudioContext';
-import { Play, Trash2, GripVertical, ListMusic, Plus, Music } from 'lucide-react';
+import { Play, Trash2, GripVertical, ListMusic, Plus, Music, Shuffle, Repeat } from 'lucide-react';
 
 export function PlaylistPanel() {
-  const { playlists, activePlaylistId, setActivePlaylist, loadTrack, currentTrack, removeTrackFromPlaylist, reorderPlaylist, createPlaylist } = useAudio();
+  const { playlists, activePlaylistId, setActivePlaylist, loadTrack, currentTrack, removeTrackFromPlaylist, reorderPlaylist, createPlaylist, isShuffle, isRepeat, toggleShuffle, toggleRepeat } = useAudio();
   const [isCreating, setIsCreating] = useState(false);
   const [newPlaylistName, setNewPlaylistName] = useState('');
   
@@ -44,12 +44,29 @@ export function PlaylistPanel() {
             <ListMusic className="w-5 h-5 text-secondary" />
             <h2>Playlists</h2>
           </div>
-          <button 
-            onClick={() => setIsCreating(!isCreating)}
-            className="p-1.5 rounded-lg hover:bg-white/10 text-muted-foreground hover:text-white transition-colors"
-          >
-            <Plus className="w-4 h-4" />
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={toggleShuffle}
+              className={`p-1.5 rounded-lg transition-all ${isShuffle ? 'bg-primary/20 text-primary shadow-[0_0_10px_rgba(0,212,255,0.15)]' : 'text-muted-foreground hover:text-white'}`}
+              title="Shuffle"
+            >
+              <Shuffle className="w-4 h-4" />
+            </button>
+            <button
+              onClick={toggleRepeat}
+              className={`p-1.5 rounded-lg transition-all ${isRepeat ? 'bg-primary/20 text-primary shadow-[0_0_10px_rgba(0,212,255,0.15)]' : 'text-muted-foreground hover:text-white'}`}
+              title="Repeat"
+            >
+              <Repeat className="w-4 h-4" />
+            </button>
+            <button
+              onClick={() => setIsCreating(!isCreating)}
+              className="p-1.5 rounded-lg hover:bg-white/10 text-muted-foreground hover:text-white transition-colors"
+              title="Add Playlist"
+            >
+              <Plus className="w-4 h-4" />
+            </button>
+          </div>
         </div>
         
         {isCreating && (
