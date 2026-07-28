@@ -18,12 +18,15 @@ export function AudioControls() {
       return;
     }
 
-    setDuration(engine.getDuration());
+    setDuration(engine.getDuration() / engine.effects.speed);
 
     const updateProgress = () => {
       if (engine.isPlaying && !isSeekingRef.current) {
-        setProgress(engine.getCurrentTime());
+        setProgress(engine.getCurrentTime() / engine.effects.speed);
+      } else if (!engine.isPlaying && !isSeekingRef.current) {
+        setProgress(engine.getCurrentTime() / engine.effects.speed);
       }
+      setDuration(engine.getDuration() / engine.effects.speed);
       rafRef.current = requestAnimationFrame(updateProgress);
     };
 
@@ -107,7 +110,7 @@ export function AudioControls() {
               setProgress(val);
             }}
             onValueCommit={([val]) => {
-              seek(val);
+              seek(val * engine.effects.speed);
               setTimeout(() => {
                 isSeekingRef.current = false;
               }, 50);
