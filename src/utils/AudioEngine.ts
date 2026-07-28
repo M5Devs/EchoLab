@@ -917,21 +917,20 @@ export class AudioEngine {
   private async timeStretchBuffer(buffer: AudioBuffer, speed: number): Promise<AudioBuffer> {
     if (Math.abs(speed - 1.0) < 0.001) return buffer;
 
-    const sr             = buffer.sampleRate;
-    const stretchedLen   = Math.ceil(buffer.length / speed);
+    const sr           = buffer.sampleRate;
+    const stretchedLen = Math.ceil(buffer.length / speed);
+    const fakeSr       = Math.round(sr * speed);
 
-    // Step 1: copy samples into a buffer declared at fakeSr
-    // When OfflineAudioContext renders it at real sr, it resamples → duration changes
-    const fakeSr    = Math.round(sr * speed);
-    const fakeBuffer = new (window.AudioContext || (window as any).webkitAudioContext)()
+    // Copy samples into a buffer tagged with fakeSr — no pitch compensation here
+    const fakeBuffer = new OfflineAudioContext(1, 1, fakeSr)
       .createBuffer(buffer.numberOfChannels, buffer.length, fakeSr);
     for (let c = 0; c < buffer.numberOfChannels; c++) {
       fakeBuffer.copyToChannel(buffer.getChannelData(c), c);
     }
 
-    // Step 2: render at real sr with pitch compensation so only duration changes
-    // pitch shift caused by resampling = log2(speed) semitones → compensate with -detune
-    const pitchCompensationCents = -Math.round(Math.log2(speed) * 1200);
+    // Render at real sr WITH pitch compensation to undo the resampling artifact
+    // Then user pitch is applied separately in renderOffline via detune
+    const pitchCompCents = -Math.round(Math.log2(speed) * 1200);
 
     const offCtx = new (window.OfflineAudioContext || (window as any).webkitOfflineAudioContext)(
       buffer.numberOfChannels,
@@ -939,8 +938,8 @@ export class AudioEngine {
       sr
     );
     const src = offCtx.createBufferSource();
-    src.buffer = fakeBuffer;
-    src.detune.value = pitchCompensationCents;
+    src.buffer        = fakeBuffer;
+    src.detune.value  = pitchCompCents; // only compensates resampling, NOT user pitch
     src.connect(offCtx.destination);
     src.start(0);
     return await offCtx.startRendering();
