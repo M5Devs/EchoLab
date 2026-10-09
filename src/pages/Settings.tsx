@@ -1,3 +1,4 @@
+import { safeGetItem, safeSetItem } from '../utils/storage';
 import { useEffect, useState } from 'react';
 import { useMIDI } from '../hooks/useMIDI';
 import { Monitor, Moon, Share2, Link as LinkIcon, Bug } from 'lucide-react';
@@ -10,7 +11,7 @@ export default function Settings() {
   });
 
   const [debugEruda, setDebugEruda] = useState<boolean>(() => {
-    return localStorage.getItem('echolab_debug_eruda') === 'true';
+    return safeGetItem<boolean>('echolab_debug_eruda', false);
   });
   
   const { midiSupported, mappings, learningCC, setLearningCC, setMappings } = useMIDI();
@@ -30,7 +31,7 @@ export default function Settings() {
   const toggleDebugEruda = () => {
     const nextVal = !debugEruda;
     setDebugEruda(nextVal);
-    localStorage.setItem('echolab_debug_eruda', String(nextVal));
+    safeSetItem('echolab_debug_eruda', nextVal);
     if (nextVal) {
       initEruda();
     } else {

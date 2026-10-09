@@ -2,6 +2,7 @@ import React, { createContext, useContext, useEffect, useRef, useState, useCallb
 import { AudioEngine, AudioEffects, defaultEffects, Track as EngineTrack, LoudnessData } from '../utils/AudioEngine';
 import { parseBlob } from 'music-metadata';
 import { toast } from 'sonner';
+import { safeGetItem, safeSetItem } from '../utils/storage';
 
 export type Track = {
   id: string;
@@ -92,6 +93,27 @@ type AudioContextType = {
 
 const AudioContext = createContext<AudioContextType | null>(null);
 
+
+function sanitizeTrackForStorage(track: Track): Track {
+  return {
+    id: track.id,
+    name: track.name,
+    artist: track.artist,
+    album: track.album,
+    year: track.year,
+    duration: track.duration,
+  };
+}
+
+function sanitizePlaylistsForStorage(playlists: Playlist[]): Playlist[] {
+  return playlists.map(playlist => ({
+    ...playlist,
+    tracks: Array.isArray(playlist.tracks)
+      ? playlist.tracks.map(sanitizeTrackForStorage)
+      : []
+  }));
+}
+
 export function AudioProvider({ children }: { children: React.ReactNode }) {
   const engineRef = useRef<AudioEngine>(new AudioEngine());
   const [isPlaying, setIsPlaying] = useState(false);
@@ -99,8 +121,14 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
   const [currentTrack, setCurrentTrack] = useState<Track | null>(null);
   const [effects, setEffects] = useState<AudioEffects>(engineRef.current.effects);
   const [playlists, setPlaylists] = useState<Playlist[]>(() => {
-    const saved = localStorage.getItem('echolab_playlists');
-    return saved ? JSON.parse(saved) : [{ id: 'default', name: 'My Tracks', tracks: [] }];
+    const fallback: Playlist[] = [{ id: 'default', name: 'My Tracks', tracks: [] }];
+    const saved = safeGetItem<Playlist[]>('echolab_playlists', fallback);
+    if (!Array.isArray(saved)) return fallback;
+    return saved.map(p => ({
+      id: String(p.id || Date.now()),
+      name: String(p.name || 'Untitled Playlist'),
+      tracks: Array.isArray(p.tracks) ? p.tracks.map(sanitizeTrackForStorage) : []
+    }));
   });
   const [activePlaylistId, setActivePlaylistId] = useState<string | null>('default');
   const [isShuffle, setIsShuffle] = useState(false);
@@ -300,7 +328,8 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
   }, [isLoaded, tracks.length]);
 
   useEffect(() => {
-    localStorage.setItem('echolab_playlists', JSON.stringify(playlists));
+    const sanitized = sanitizePlaylistsForStorage(playlists);
+    safeSetItem('echolab_playlists', sanitized);
   }, [playlists]);
 
   // ── Media Session Integration ──────────────────────────────────────────────

@@ -1,3 +1,4 @@
+import { safeGetItem, safeSetItem } from '../utils/storage';
 import { useEffect, useState } from 'react';
 import { useAudio } from '../contexts/AudioContext';
 
@@ -9,8 +10,8 @@ export function useMIDI() {
   const [learningCC, setLearningCC] = useState<string | null>(null); // the effect key waiting to be learned
   
   const [mappings, setMappings] = useState<MIDIMapping>(() => {
-    const saved = localStorage.getItem('echolab_midi');
-    return saved ? JSON.parse(saved) : {
+    const saved = safeGetItem<MIDIMapping | null>('echolab_midi', null);
+    return saved ? saved : {
       1: 'speed',
       2: 'reverb',
       3: 'volume',
@@ -20,7 +21,7 @@ export function useMIDI() {
   });
 
   useEffect(() => {
-    localStorage.setItem('echolab_midi', JSON.stringify(mappings));
+    safeSetItem('echolab_midi', mappings);
   }, [mappings]);
 
   useEffect(() => {
