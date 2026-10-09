@@ -285,8 +285,127 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
   }, [updateState, activePlaylistId, currentTrack, playlists, loadTrack]);
 
   useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (isLoaded || tracks.length > 0) {
+        e.preventDefault();
+        e.returnValue = '';
+        return '';
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, [isLoaded, tracks.length]);
+
+  useEffect(() => {
     localStorage.setItem('echolab_playlists', JSON.stringify(playlists));
   }, [playlists]);
+
+  // ── Media Session Integration ──────────────────────────────────────────────
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return;
+
+    if (currentTrack) {
+      const artwork = currentTrack.coverArt
+        ? [{ src: currentTrack.coverArt, sizes: '512x512', type: 'image/png' }]
+        : [
+            { src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png' },
+            { src: '/pwa-512x512.png', sizes: '512x512', type: 'image/png' },
+          ];
+
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: currentTrack.name || 'Untitled Track',
+        artist: 'EchoLab Local Studio',
+        album: 'In-Memory Session',
+        artwork,
+      });
+    } else {
+      navigator.mediaSession.metadata = null;
+    }
+  }, [currentTrack]);
+
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return;
+
+    navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+
+    if (isLoaded && engineRef.current) {
+      const duration = engineRef.current.getDuration() / (engineRef.current.effects.speed || 1);
+      const position = Math.min(
+        engineRef.current.getCurrentTime() / (engineRef.current.effects.speed || 1),
+        duration || 0
+      );
+      if (
+        duration > 0 &&
+        !isNaN(duration) &&
+        !isNaN(position) &&
+        'setPositionState' in navigator.mediaSession
+      ) {
+        try {
+          navigator.mediaSession.setPositionState({
+            duration,
+            playbackRate: engineRef.current.effects.speed || 1,
+            position,
+          });
+        } catch (e) {
+          console.warn('MediaSession setPositionState failed:', e);
+        }
+      }
+    }
+  }, [isPlaying, isLoaded]);
+
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return;
+
+    const actionHandlers: [MediaSessionAction, MediaSessionActionHandler][] = [
+      [
+        'play',
+        () => {
+          engineRef.current.resumeContext().then(() => {
+            if (!engineRef.current.isPlaying) {
+              engineRef.current.play();
+            }
+          });
+        },
+      ],
+      [
+        'pause',
+        () => {
+          if (engineRef.current.isPlaying) {
+            engineRef.current.pause();
+          }
+        },
+      ],
+      [
+        'seekto',
+        (details) => {
+          if (details.seekTime !== undefined) {
+            const actualTime = details.seekTime * (engineRef.current.effects.speed || 1);
+            engineRef.current.seek(actualTime);
+          }
+        },
+      ],
+    ];
+
+    for (const [action, handler] of actionHandlers) {
+      try {
+        navigator.mediaSession.setActionHandler(action, handler);
+      } catch (e) {
+        console.warn(`MediaSession action handler for ${action} not supported`, e);
+      }
+    }
+
+    return () => {
+      for (const [action] of actionHandlers) {
+        try {
+          navigator.mediaSession.setActionHandler(action, null);
+        } catch (e) {}
+      }
+    };
+  }, []);
+
 
   const togglePlay = () => {
     const engine = engineRef.current;

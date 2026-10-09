@@ -1,16 +1,12 @@
 import { useState } from 'react';
 import { useAudio } from '../contexts/AudioContext';
-import { useFirebase } from '../hooks/useFirebase';
-import { Download, Loader2, Cloud, CloudOff } from 'lucide-react';
+import { Download, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 
 export function ExportPanel() {
   const { isLoaded, exportWav, exportMp3, currentTrack } = useAudio();
-  const { user, uploadAudio, login } = useFirebase();
   const [format, setFormat] = useState<'wav' | 'mp3'>('wav');
   const [isExporting, setIsExporting] = useState(false);
-  const [isUploading, setIsUploading] = useState(false);
-  const [cloudUrl, setCloudUrl] = useState<string | null>(null);
 
   const getBlob = async (): Promise<Blob | null> => {
     if (format === 'wav') return exportWav();
@@ -36,27 +32,6 @@ export function ExportPanel() {
       toast.error('Export failed');
     } finally {
       setIsExporting(false);
-    }
-  };
-
-  const handleUploadToCloud = async () => {
-    if (!isLoaded) return;
-    if (!user) { login(); return; }
-    try {
-      setIsUploading(true);
-      const blob = await getBlob();
-      if (!blob) throw new Error('Export failed');
-      const filename = `${currentTrack?.name || 'echolab-master'}-${Date.now()}.${format}`;
-      const url = await uploadAudio(filename, blob);
-      if (url) {
-        setCloudUrl(url);
-        await navigator.clipboard.writeText(url).catch(() => {});
-      }
-    } catch (e) {
-      console.error(e);
-      toast.error('Upload failed');
-    } finally {
-      setIsUploading(false);
     }
   };
 
@@ -93,38 +68,6 @@ export function ExportPanel() {
         {isExporting ? <Loader2 className="w-5 h-5 animate-spin" /> : <Download className="w-5 h-5" />}
         {isExporting ? 'Rendering Audio…' : `Download ${format.toUpperCase()}`}
       </button>
-
-      {/* Divider */}
-      <div className="flex items-center gap-3 text-xs text-muted-foreground">
-        <div className="flex-1 h-px bg-white/10" />OR<div className="flex-1 h-px bg-white/10" />
-      </div>
-
-      {/* Upload to cloud */}
-      <button
-        onClick={handleUploadToCloud}
-        disabled={!isLoaded || isUploading}
-        className="w-full py-4 rounded-xl border border-primary/40 bg-primary/5 hover:bg-primary/10 text-primary font-bold flex items-center justify-center gap-2 hover:scale-[1.02] transition-transform disabled:opacity-50 disabled:pointer-events-none"
-      >
-        {isUploading
-          ? <Loader2 className="w-5 h-5 animate-spin" />
-          : user ? <Cloud className="w-5 h-5" /> : <CloudOff className="w-5 h-5" />}
-        {isUploading ? 'Uploading…' : user ? 'Upload to Cloud' : 'Sign in to Upload'}
-      </button>
-
-      {/* Cloud URL result */}
-      {cloudUrl && (
-        <div className="mt-2 p-3 bg-black/40 border border-primary/20 rounded-lg space-y-1">
-          <p className="text-xs text-muted-foreground">Download URL (copied to clipboard):</p>
-          <a
-            href={cloudUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-xs text-primary break-all hover:underline"
-          >
-            {cloudUrl}
-          </a>
-        </div>
-      )}
     </div>
   );
 }
