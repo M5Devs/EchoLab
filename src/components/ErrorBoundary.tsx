@@ -1,5 +1,5 @@
 import React, { Component, ErrorInfo, ReactNode } from 'react';
-import { AlertTriangle, RefreshCw } from 'lucide-react';
+import { AlertTriangle, RefreshCw, Trash2 } from 'lucide-react';
 
 interface Props {
   children: ReactNode;
@@ -29,6 +29,17 @@ export class ErrorBoundary extends Component<Props, State> {
     window.location.reload();
   };
 
+  private handleClearCacheAndReload = () => {
+    try {
+      localStorage.clear();
+      sessionStorage.clear();
+    } catch (e) {
+      console.warn('Failed to clear storage:', e);
+    }
+    this.setState({ hasError: false, error: null });
+    window.location.reload();
+  };
+
   public render() {
     if (this.state.hasError) {
       return (
@@ -43,12 +54,20 @@ export class ErrorBoundary extends Component<Props, State> {
                 {this.state.error?.message || 'An unexpected runtime error occurred.'}
               </p>
             </div>
-            <button
-              onClick={this.handleReset}
-              className="px-6 py-2.5 bg-primary hover:bg-primary/90 text-black font-semibold rounded-xl flex items-center gap-2 transition-all shadow-lg shadow-primary/20"
-            >
-              <RefreshCw className="w-4 h-4" /> Reset & Try Again
-            </button>
+            <div className="flex flex-col sm:flex-row gap-3 w-full">
+              <button
+                onClick={this.handleReset}
+                className="flex-1 px-4 py-2.5 bg-primary hover:bg-primary/90 text-black font-semibold rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg shadow-primary/20 text-sm"
+              >
+                <RefreshCw className="w-4 h-4" /> Reset & Try Again
+              </button>
+              <button
+                onClick={this.handleClearCacheAndReload}
+                className="flex-1 px-4 py-2.5 bg-white/10 hover:bg-red-500/20 text-red-300 hover:text-red-200 border border-red-500/30 font-semibold rounded-xl flex items-center justify-center gap-2 transition-all text-sm"
+              >
+                <Trash2 className="w-4 h-4" /> Clear Cache & Reload
+              </button>
+            </div>
           </div>
         </div>
       );

@@ -1,9 +1,10 @@
+import { safeGetItem } from './storage';
 export async function initEruda() {
   if (typeof window === 'undefined') return;
 
   const urlParams = new URLSearchParams(window.location.search);
   const debugQuery = urlParams.get('debug') === 'true';
-  const debugSetting = localStorage.getItem('echolab_debug_eruda') === 'true';
+  const debugSetting = safeGetItem<boolean>('echolab_debug_eruda', false);
   const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
     navigator.userAgent
   ) || window.innerWidth < 768;
