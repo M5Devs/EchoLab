@@ -1,3 +1,5 @@
+import { toast } from 'sonner';
+import { downmixToStereo } from '../utils/AudioEngine';
 import { useAudio } from '../contexts/AudioContext';
 import { Slider } from './ui/slider';
 import { Mic, Plus, Trash2, Volume2, VolumeX } from 'lucide-react';
@@ -11,8 +13,14 @@ export function MultiTrackMixer() {
       const reader = new FileReader();
       reader.onload = async (ev) => {
         const arr = ev.target?.result as ArrayBuffer;
-        const buf = await engine.ctx.decodeAudioData(arr);
-        engine.addTrack(buf, file.name);
+        try {
+          const rawBuf = await engine.ctx.decodeAudioData(arr);
+          const buf = downmixToStereo(rawBuf, engine.ctx);
+          engine.addTrack(buf, file.name);
+        } catch (err: any) {
+          console.error('MultiTrackMixer audio decode error:', err);
+          toast.error('Failed to decode audio. Format might be unsupported or corrupt.');
+        }
       };
       reader.readAsArrayBuffer(file);
     }

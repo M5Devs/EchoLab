@@ -1,11 +1,16 @@
 import { useEffect, useState } from 'react';
 import { useMIDI } from '../hooks/useMIDI';
-import { Monitor, Moon, Share2, Link as LinkIcon } from 'lucide-react';
+import { Monitor, Moon, Share2, Link as LinkIcon, Bug } from 'lucide-react';
 import { useAudio } from '../contexts/AudioContext';
+import { initEruda } from '../utils/eruda';
 
 export default function Settings() {
   const [theme, setTheme] = useState<'dark' | 'oled'>(() => {
     return document.documentElement.classList.contains('oled') ? 'oled' : 'dark';
+  });
+
+  const [debugEruda, setDebugEruda] = useState<boolean>(() => {
+    return localStorage.getItem('echolab_debug_eruda') === 'true';
   });
   
   const { midiSupported, mappings, learningCC, setLearningCC, setMappings } = useMIDI();
@@ -21,6 +26,17 @@ export default function Settings() {
   }, [theme]);
 
   const toggleTheme = () => setTheme(prev => prev === 'dark' ? 'oled' : 'dark');
+
+  const toggleDebugEruda = () => {
+    const nextVal = !debugEruda;
+    setDebugEruda(nextVal);
+    localStorage.setItem('echolab_debug_eruda', String(nextVal));
+    if (nextVal) {
+      initEruda();
+    } else {
+      window.location.reload();
+    }
+  };
 
   const handleCopyLink = () => {
     const link = getShareableLink();
@@ -59,8 +75,27 @@ export default function Settings() {
           </div>
         </div>
 
-        {/* Shareable Link */}
+        {/* Debug Console */}
         <div className="glass-panel p-6 rounded-xl space-y-4">
+          <h2 className="text-xl font-medium border-b border-white/10 pb-2">Debugging & Tools</h2>
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="font-medium">Mobile Debug Console (Eruda)</div>
+              <div className="text-sm text-muted-foreground">Toggle inspector & console for mobile browser testing</div>
+            </div>
+            <button
+              onClick={toggleDebugEruda}
+              className={`w-14 h-8 rounded-full p-1 transition-colors ${debugEruda ? 'bg-primary' : 'bg-white/10'}`}
+            >
+              <div className={`w-6 h-6 rounded-full bg-white transition-transform ${debugEruda ? 'translate-x-6' : 'translate-x-0'} flex items-center justify-center`}>
+                <Bug className="w-4 h-4 text-black" />
+              </div>
+            </button>
+          </div>
+        </div>
+
+        {/* Shareable Link */}
+        <div className="glass-panel p-6 rounded-xl space-y-4 md:col-span-2">
           <h2 className="text-xl font-medium border-b border-white/10 pb-2">Share Preset</h2>
           <p className="text-sm text-muted-foreground">Generate a URL that contains your exact effect chain settings.</p>
           <button 

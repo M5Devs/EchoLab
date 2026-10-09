@@ -200,9 +200,19 @@ export class AudioEngine {
 
     this.channelMerger = this.ctx.createChannelMerger(2);
 
-    this.mediaStreamDestination = this.ctx.createMediaStreamDestination();
     this.audioBridge = new Audio();
-    this.audioBridge.srcObject = this.mediaStreamDestination.stream;
+    this.audioBridge.crossOrigin = 'anonymous';
+    this.audioBridge.muted = false;
+
+    try {
+      this.mediaStreamDestination = this.ctx.createMediaStreamDestination();
+      this.audioBridge.srcObject = this.mediaStreamDestination.stream;
+    } catch (e) {
+      console.warn('createMediaStreamDestination failed, using silent WAV bridge fallback:', e);
+      this.mediaStreamDestination = null as any;
+      this.audioBridge.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAAAA';
+      this.audioBridge.loop = true;
+    }
 
     this.dbPromise = openDB<EchoLabDB>('echolab-projects', 1, {
       upgrade(db) {
@@ -243,8 +253,15 @@ export class AudioEngine {
 
   async loadBuffer(arrayBuffer: ArrayBuffer) {
     await this.resumeContext();
-    const newBuffer = await this.ctx.decodeAudioData(arrayBuffer);
-    this.setBuffer(newBuffer);
+    let decodedBuffer: AudioBuffer;
+    try {
+      decodedBuffer = await this.ctx.decodeAudioData(arrayBuffer);
+    } catch (e: any) {
+      console.error('decodeAudioData error in loadBuffer:', e);
+      throw new Error('Failed to decode audio. Format might be unsupported or corrupt.');
+    }
+    const processedBuffer = downmixToStereo(decodedBuffer, this.ctx);
+    this.setBuffer(processedBuffer);
   }
 
   async loadUrl(url: string) {
@@ -498,7 +515,13 @@ export class AudioEngine {
     this.resumeContext();
 
     if (this.audioBridge) {
-      this.audioBridge.play().catch(e => console.warn('AudioBridge play error:', e));
+      this.audioBridge.play().catch(e => {
+        console.warn('AudioBridge stream play failed, trying silent WAV fallback:', e);
+        this.audioBridge.srcObject = null;
+        this.audioBridge.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAAAA';
+        this.audioBridge.loop = true;
+        this.audioBridge.play().catch(err => console.warn('AudioBridge fallback play failed:', err));
+      });
     }
 
     const offset = this.pauseTime;
@@ -793,7 +816,15 @@ export class AudioEngine {
           this.recordingStream.getTracks().forEach(t => t.stop());
         }
         const arrayBuffer = await blob.arrayBuffer();
-        const buffer = await this.ctx.decodeAudioData(arrayBuffer);
+        let buffer: AudioBuffer;
+        try {
+          const rawBuffer = await this.ctx.decodeAudioData(arrayBuffer);
+          buffer = downmixToStereo(rawBuffer, this.ctx);
+        } catch (e) {
+          console.error('decodeAudioData failed during recording stop:', e);
+          this.onStateChange();
+          return resolve(null);
+        }
         this.onStateChange();
         resolve(buffer);
       };
@@ -1132,4 +1163,53 @@ export class AudioEngine {
     const db = await this.dbPromise;
     await db.delete('projects', id);
   }
+}
+
+
+export function downmixToStereo(buffer: AudioBuffer, ctx: AudioContext): AudioBuffer {
+  if (buffer.numberOfChannels <= 2) {
+    return buffer;
+  }
+
+  const numChannels = buffer.numberOfChannels;
+  const length = buffer.length;
+  const sampleRate = buffer.sampleRate;
+  const stereoBuffer = ctx.createBuffer(2, length, sampleRate);
+  const leftOut = stereoBuffer.getChannelData(0);
+  const rightOut = stereoBuffer.getChannelData(1);
+
+  const channelsData: Float32Array[] = [];
+  for (let c = 0; c < numChannels; c++) {
+    channelsData.push(buffer.getChannelData(c));
+  }
+
+  // Multichannel downmixing strategy:
+  // FL (0), FR (1), FC (2), LFE (3), BL/SL (4), BR/SR (5)
+  if (numChannels >= 6) {
+    for (let i = 0; i < length; i++) {
+      const fl = channelsData[0][i];
+      const fr = channelsData[1][i];
+      const fc = channelsData[2][i];
+      const sl = channelsData[4][i];
+      const sr = channelsData[5][i];
+
+      leftOut[i] = (fl + fc * 0.7071 + sl * 0.7071) * 0.5;
+      rightOut[i] = (fr + fc * 0.7071 + sr * 0.7071) * 0.5;
+    }
+  } else {
+    // Generic N-channel average downmix to stereo
+    const scale = 1.0 / Math.sqrt(numChannels);
+    for (let i = 0; i < length; i++) {
+      let leftSum = 0;
+      let rightSum = 0;
+      for (let c = 0; c < numChannels; c++) {
+        if (c % 2 === 0) leftSum += channelsData[c][i];
+        else rightSum += channelsData[c][i];
+      }
+      leftOut[i] = leftSum * scale;
+      rightOut[i] = rightSum * scale;
+    }
+  }
+
+  return stereoBuffer;
 }
