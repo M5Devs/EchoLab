@@ -22,7 +22,6 @@ import {
   listCloudProjects,
   deleteCloudProject,
   sharePreset as fbSharePreset,
-  uploadAudioFile,
 } from '../firebase';
 
 export type CloudProject = {
@@ -63,7 +62,6 @@ type FirebaseContextType = {
   refreshCloudProjects: () => Promise<void>;
   deleteFromCloud: (projectId: string) => Promise<void>;
   sharePreset: (name: string, effects: object) => Promise<string | null>;
-  uploadAudio: (filename: string, blob: Blob) => Promise<string | null>;
 };
 
 const FirebaseContext = createContext<FirebaseContextType | null>(null);
@@ -200,20 +198,7 @@ export function FirebaseProvider({ children }: { children: React.ReactNode }) {
     [user]
   );
 
-  const uploadAudio = useCallback(
-    async (filename: string, blob: Blob): Promise<string | null> => {
-      if (!user || user.isAnonymous) { toast.error('Sign in to upload audio'); return null; }
-      try {
-        const url = await uploadAudioFile(user.uid, filename, blob);
-        toast.success('Audio uploaded ☁️');
-        return url;
-      } catch {
-        toast.error('Upload failed');
-        return null;
-      }
-    },
-    [user]
-  );
+
 
   return (
     <FirebaseContext.Provider
@@ -236,7 +221,6 @@ export function FirebaseProvider({ children }: { children: React.ReactNode }) {
         refreshCloudProjects,
         deleteFromCloud,
         sharePreset,
-        uploadAudio,
       }}
     >
       {children}

@@ -25,12 +25,7 @@ import {
   query,
   orderBy,
 } from 'firebase/firestore';
-import {
-  getStorage,
-  ref,
-  uploadBytes,
-  getDownloadURL,
-} from 'firebase/storage';
+
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -50,7 +45,6 @@ export const db = initializeFirestore(app, {
   }),
 });
 
-export const storage = getStorage(app);
 
 // ── Providers ─────────────────────────────────────────────────────────────────
 
@@ -123,10 +117,4 @@ export async function sharePreset(uid: string, presetName: string, effects: obje
   return docRef.id;
 }
 
-// ── Storage helpers ───────────────────────────────────────────────────────────
 
-export async function uploadAudioFile(uid: string, filename: string, blob: Blob): Promise<string> {
-  const storageRef = ref(storage, `users/${uid}/audio/${filename}`);
-  await uploadBytes(storageRef, blob);
-  return getDownloadURL(storageRef);
-}

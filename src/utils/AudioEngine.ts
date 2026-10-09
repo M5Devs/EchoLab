@@ -90,23 +90,9 @@ interface EchoLabDB extends DBSchema {
       id: string;
       name: string;
       savedAt: number;
-      leftChannel?: Float32Array;
-      rightChannel?: Float32Array;
-      sampleRate?: number;
       duration?: number;
       effects: AudioEffects;
       playlists: any[];
-      tracks?: Array<{
-        id: string;
-        name: string;
-        leftChannel: Float32Array;
-        rightChannel: Float32Array;
-        sampleRate: number;
-        volume: number;
-        pan: number;
-        muted: boolean;
-        solo: boolean;
-      }>;
     };
   };
 }
@@ -116,6 +102,8 @@ export class AudioEngine {
   buffer: AudioBuffer | null = null;
   source: AudioBufferSourceNode | null = null;
   analyser: AnalyserNode;
+  mediaStreamDestination: MediaStreamAudioDestinationNode;
+  audioBridge: HTMLAudioElement;
 
   highpassNode: BiquadFilterNode;
   lowpassNode: BiquadFilterNode;
@@ -211,6 +199,10 @@ export class AudioEngine {
     this.analyser.fftSize = 2048;
 
     this.channelMerger = this.ctx.createChannelMerger(2);
+
+    this.mediaStreamDestination = this.ctx.createMediaStreamDestination();
+    this.audioBridge = new Audio();
+    this.audioBridge.srcObject = this.mediaStreamDestination.stream;
 
     this.dbPromise = openDB<EchoLabDB>('echolab-projects', 1, {
       upgrade(db) {
@@ -498,12 +490,16 @@ export class AudioEngine {
     this.pannerNode.connect(this.compressorNode);
     this.compressorNode.connect(this.volumeNode);
     this.volumeNode.connect(this.analyser);
-    this.analyser.connect(this.ctx.destination);
+    this.analyser.connect(this.mediaStreamDestination);
   }
 
   play() {
     if (!this.buffer && this.tracks.length === 0) return;
     this.resumeContext();
+
+    if (this.audioBridge) {
+      this.audioBridge.play().catch(e => console.warn('AudioBridge play error:', e));
+    }
 
     const offset = this.pauseTime;
 
@@ -576,6 +572,10 @@ export class AudioEngine {
 
   pause() {
     if (!this.isPlaying) return;
+
+    if (this.audioBridge) {
+      this.audioBridge.pause();
+    }
     this.pauseTime = this.getCurrentTime();
 
     if (this.source) {
@@ -595,6 +595,10 @@ export class AudioEngine {
   }
 
   stop() {
+    if (this.audioBridge) {
+      this.audioBridge.pause();
+    }
+
     if (this.source) {
       try { this.source.stop(); } catch (e) {}
       this.source = null;
@@ -1101,11 +1105,6 @@ export class AudioEngine {
       playlists
     };
     if (this.buffer) {
-      proj.leftChannel = this.buffer.getChannelData(0);
-      if (this.buffer.numberOfChannels > 1) {
-        proj.rightChannel = this.buffer.getChannelData(1);
-      }
-      proj.sampleRate = this.buffer.sampleRate;
       proj.duration = this.buffer.duration;
     }
     await db.put('projects', proj);
@@ -1117,18 +1116,9 @@ export class AudioEngine {
     const proj = await db.get('projects', id);
     if (!proj) return null;
 
-    if (proj.leftChannel && proj.sampleRate) {
-      const channels = proj.rightChannel ? 2 : 1;
-      const buffer = this.ctx.createBuffer(channels, proj.leftChannel.length, proj.sampleRate);
-      buffer.copyToChannel(new Float32Array(proj.leftChannel), 0);
-      if (proj.rightChannel) {
-        buffer.copyToChannel(new Float32Array(proj.rightChannel), 1);
-      }
-      this.setBuffer(buffer, true);
-    } else {
-      this.setBuffer(null);
+    if (proj.effects) {
+      this.applyEffects(proj.effects);
     }
-    this.applyEffects(proj.effects);
     return proj;
   }
 
