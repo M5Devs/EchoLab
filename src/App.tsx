@@ -1,3 +1,4 @@
+import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { useState } from 'react';
 import { Route, Switch, Router as WouterRouter } from 'wouter';
 import { AudioProvider } from '@/contexts/AudioContext';
@@ -147,14 +148,16 @@ function Router() {
 
 function App() {
   return (
-    <WouterRouter base={import.meta.env.BASE_URL?.replace(/\/$/, '')}>
-      <FirebaseProvider>
-        <AudioProvider>
-          <Router />
-          <Toaster theme="dark" position="bottom-right" />
-        </AudioProvider>
-      </FirebaseProvider>
-    </WouterRouter>
+    <ErrorBoundary>
+      <WouterRouter base={import.meta.env.BASE_URL?.replace(/\/$/, '')}>
+        <FirebaseProvider>
+          <AudioProvider>
+            <Router />
+            <Toaster theme="dark" position="bottom-right" />
+          </AudioProvider>
+        </FirebaseProvider>
+      </WouterRouter>
+    </ErrorBoundary>
   );
 }
 

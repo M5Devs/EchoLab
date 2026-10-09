@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "buffer": "^6.0.3",
+    "eruda": "^3.4.3",
     "firebase": "^12.16.0",
     "idb": "^8.0.3",
     "jszip": "^3.10.1",

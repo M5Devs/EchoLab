@@ -371,6 +371,18 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
         },
       ],
       [
+        'previoustrack',
+        () => {
+          playPreviousTrack();
+        },
+      ],
+      [
+        'nexttrack',
+        () => {
+          playNextTrack();
+        },
+      ],
+      [
         'pause',
         () => {
           if (engineRef.current.isPlaying) {
