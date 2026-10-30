@@ -8,6 +8,7 @@ import {
   normalizeStudioFx,
 } from './studioFx';
 import { fetchAudioWithProxy } from './audioProxy';
+import { validateAudioPayload } from './audioFormat';
 
 export type EQBandType = 'lowshelf' | 'peaking' | 'highshelf' | 'lowpass' | 'highpass';
 
@@ -273,7 +274,14 @@ export class AudioEngine {
     }
   }
 
-  async loadBuffer(arrayBuffer: ArrayBuffer) {
+  async loadBuffer(arrayBuffer: ArrayBuffer, contentType?: string | null) {
+    // Reject web pages, JSON and playlists before handing the payload to
+    // decodeAudioData, which would otherwise fail with an opaque EncodingError.
+    const sniffed = validateAudioPayload(arrayBuffer, contentType);
+    if (!sniffed.ok) {
+      throw new Error(sniffed.message);
+    }
+
     await this.resumeContext();
     let decodedBuffer: AudioBuffer;
     try {
@@ -290,8 +298,9 @@ export class AudioEngine {
     // Direct fetch first; on CORS failure the Cloudflare Worker proxy relays the
     // stream (Range-aware, so scrubbing still works).
     const response = await fetchAudioWithProxy(url);
+    const contentType = response.headers.get('content-type');
     const arrayBuffer = await response.arrayBuffer();
-    await this.loadBuffer(arrayBuffer);
+    await this.loadBuffer(arrayBuffer, contentType);
   }
 
   setBuffer(buffer: AudioBuffer | null, pushToHistory = true) {

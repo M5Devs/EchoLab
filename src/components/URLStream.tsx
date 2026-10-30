@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { useAudio } from '../contexts/AudioContext';
 import { Link2, Loader2 } from 'lucide-react';
+import { toast } from 'sonner';
+import { describeUnsupportedPageUrl } from '../utils/audioFormat';
 
 export function URLStream() {
   const { loadTrack } = useAudio();
@@ -11,6 +13,15 @@ export function URLStream() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!url.trim()) return;
+
+    // Fail fast on streaming-service *pages* (SoundCloud et al): EchoLab has no
+    // resolver for them, so the fetch could only ever return HTML.
+    const pageMessage = describeUnsupportedPageUrl(url);
+    if (pageMessage) {
+      setError(pageMessage);
+      toast.error(pageMessage);
+      return;
+    }
 
     setIsLoading(true);
     setError('');

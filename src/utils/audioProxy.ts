@@ -10,6 +10,8 @@
  * back to the same-origin `/api/audio-proxy` route.
  */
 
+import { HTML_PAGE_MESSAGE, PLAYLIST_MESSAGE } from './audioFormat';
+
 const DEFAULT_PROXY_PATH = '/api/audio-proxy';
 
 export function getAudioProxyEndpoint(): string {
@@ -56,6 +58,21 @@ function describeFailure(status?: number): string {
 }
 
 /**
+ * Build the message for a non-OK response.
+ *
+ * An HTML body is reported as such even when the status also carries a meaning
+ * (a Cloudflare/captcha interstitial is a 403 whose body is a web page), because
+ * "you were served a web page" is the actionable diagnosis. Other statuses keep
+ * their precise HTTP meaning — a 404 body is not more informative than "not found".
+ */
+function describeHttpFailure(response: Response): string {
+  const contentType = response.headers.get('content-type') ?? '';
+  if (/text\/html|application\/xhtml/i.test(contentType)) return HTML_PAGE_MESSAGE;
+  if (/mpegurl/i.test(contentType)) return PLAYLIST_MESSAGE;
+  return describeFailure(response.status);
+}
+
+/**
  * Fetch an audio resource, first directly (cheap, no proxy hop) and then through
  * the proxy. Throws an {@link AudioProxyError} with a user-facing message.
  */
@@ -68,7 +85,9 @@ export async function fetchAudioWithProxy(
 
   if (!isRemote) {
     const direct = await fetchImpl(url, init);
-    if (!direct.ok) throw new AudioProxyError(describeFailure(direct.status), direct.status);
+    if (!direct.ok) {
+      throw new AudioProxyError(describeHttpFailure(direct), direct.status);
+    }
     return direct;
   }
 
@@ -81,7 +100,9 @@ export async function fetchAudioWithProxy(
 
   try {
     const proxied = await fetchImpl(getProxiedAudioUrl(url), init);
-    if (!proxied.ok) throw new AudioProxyError(describeFailure(proxied.status), proxied.status);
+    if (!proxied.ok) {
+      throw new AudioProxyError(describeHttpFailure(proxied), proxied.status);
+    }
     return proxied;
   } catch (err) {
     if (err instanceof AudioProxyError) throw err;
