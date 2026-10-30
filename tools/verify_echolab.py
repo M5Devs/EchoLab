@@ -7,14 +7,59 @@ real MediaSession) rather than in a mocked Node environment.
 """
 
 import json
+import os
+import socket
+import struct
+import subprocess
 import sys
 import time
+from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
 BASE = "http://127.0.0.1:5173"
+UPSTREAM_PORT = 8898
+UPSTREAM = f"http://127.0.0.1:{UPSTREAM_PORT}"
+FIXTURE_DIR = Path("/tmp/echolab_fixtures")
+FIXTURE_WAV = FIXTURE_DIR / "tone.wav"
 
 results = []
+
+
+def write_fixture_wav(path: Path, seconds: float = 1.0, sample_rate: int = 8000) -> None:
+    """Write a small, genuinely decodable 16-bit PCM WAV for the upload test."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frames = int(sample_rate * seconds)
+    samples = b"".join(
+        struct.pack("<h", int(12000 * (1 if (i // 20) % 2 == 0 else -1)))
+        for i in range(frames)
+    )
+    header = b"RIFF" + struct.pack("<I", 36 + len(samples)) + b"WAVE"
+    header += b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate,
+                                    sample_rate * 2, 2, 16)
+    header += b"data" + struct.pack("<I", len(samples))
+    path.write_bytes(header + samples)
+
+
+def port_is_open(port: int) -> bool:
+    with socket.socket() as sock:
+        sock.settimeout(0.3)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def start_upstream() -> subprocess.Popen | None:
+    """Start the foreign-origin test server unless something already listens."""
+    if port_is_open(UPSTREAM_PORT):
+        return None
+    script = Path(__file__).with_name("test_upstream.py")
+    proc = subprocess.Popen([sys.executable, str(script), str(UPSTREAM_PORT)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(50):
+        if port_is_open(UPSTREAM_PORT):
+            return proc
+        time.sleep(0.1)
+    proc.terminate()
+    raise RuntimeError(f"test upstream failed to start on port {UPSTREAM_PORT}")
 
 
 def check(name, ok, detail=""):
@@ -23,6 +68,29 @@ def check(name, ok, detail=""):
 
 
 def main():
+    upstream = start_upstream()
+    write_fixture_wav(FIXTURE_WAV)
+    try:
+        return run(upstream)
+    finally:
+        if upstream is not None:
+            upstream.terminate()
+            try:
+                upstream.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                upstream.kill()
+
+
+def run(upstream):
+    # Size of the audio payload the test upstream serves, so byte-count
+    # assertions stay correct if the fixture changes.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "test_upstream", Path(__file__).with_name("test_upstream.py"))
+    upstream_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(upstream_mod)
+    audio_bytes = len(upstream_mod.WAV)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             executable_path="/usr/bin/chromium",
@@ -423,7 +491,7 @@ def main():
         check("beforeunload guard wired", guard["listener"] and guard["preventDefault"])
 
         # ── 12. End-to-end: real file upload → in-memory decode → FX → guard ──
-        page.set_input_files("input[type=file][accept='audio/*']", "/tmp/echolab_fixtures/tone.wav")
+        page.set_input_files("input[type=file][accept='audio/*']", str(FIXTURE_WAV))
         page.wait_for_timeout(2500)
 
         e2e = page.evaluate(
@@ -625,11 +693,11 @@ def main():
         check("direct cross-origin fetch is CORS-blocked", proxy_fetch["directBlocked"] is True)
         check("proxy relays the remote stream intact",
               proxy_fetch["status"] == 200 and proxy_fetch["riff"] == "RIFF"
-              and proxy_fetch["bytes"] == 88244,
-              f"{proxy_fetch['bytes']} bytes")
+              and proxy_fetch["bytes"] == audio_bytes,
+              f"{proxy_fetch['bytes']} bytes (expected {audio_bytes})")
         check("proxy preserves Range/206 for seeking",
               proxy_fetch["rangeStatus"] == 206
-              and proxy_fetch["contentRange"] == "bytes 0-99/88244"
+              and proxy_fetch["contentRange"] == f"bytes 0-99/{audio_bytes}"
               and proxy_fetch["rangeBytes"] == 100,
               f"{proxy_fetch['rangeStatus']} {proxy_fetch['contentRange']}")
         check("missing track raises AudioProxyError with friendly message",
@@ -889,7 +957,218 @@ def main():
                                       for t in toasts),
               json.dumps(toasts))
 
-        # ── 24. Firebase is safe whether or not it is configured ──────────────
+        # ── 24. Audio payload validation: web pages never reach the decoder ───
+        # The bug: fetching a SoundCloud/captcha page or an HLS playlist handed
+        # HTML to decodeAudioData, which threw an opaque
+        # "EncodingError: Unable to decode audio data". The gate must reject the
+        # payload *before* decoding and explain why.
+        page.evaluate("() => { window.__toasts = []; }")
+        page.goto(BASE, wait_until="load")
+        page.wait_for_timeout(2500)
+
+        validation = page.evaluate(
+            """async () => {
+            const { AudioEngine } = await import('/src/utils/AudioEngine.ts');
+            const U = 'http://127.0.0.1:8898';
+            const out = {};
+
+            // Spy on the decoder: it must NOT be reached for non-audio payloads.
+            const proto = AudioContext.prototype;
+            const realDecode = proto.decodeAudioData;
+            let decodeCalls = 0;
+            proto.decodeAudioData = function (...a) { decodeCalls++; return realDecode.apply(this, a); };
+
+            const attempt = async (url) => {
+                const engine = new AudioEngine();
+                const before = decodeCalls;
+                const res = { };
+                try {
+                    await engine.loadUrl(url);
+                    res.ok = true;
+                } catch (e) {
+                    res.ok = false;
+                    res.msg = e.message;
+                    res.name = e.name;
+                }
+                res.decodeCalls = decodeCalls - before;
+                res.buffer = !!engine.buffer;
+                engine.dispose();
+                return res;
+            };
+
+            out.page      = await attempt(U + '/page');
+            out.captcha   = await attempt(U + '/captcha');
+            out.playlist  = await attempt(U + '/playlist.m3u8');
+            out.json      = await attempt(U + '/api.json');
+            out.mislabelled = await attempt(U + '/mislabelled.mp3');
+            out.valid     = await attempt(U + '/song.mp3');
+            out.missing   = await attempt(U + '/notfound.mp3');
+            out.boom      = await attempt(U + '/boom.mp3');
+            out.totalDecodeCalls = decodeCalls;
+
+            proto.decodeAudioData = realDecode;
+
+            // Direct module-level checks (Content-Type vs magic bytes).
+            const fmt = await import('/src/utils/audioFormat.ts');
+            // Bytes must be built from base64: TextEncoder cannot express raw
+            // high bytes (0xFF would become the U+FFFD replacement character).
+            const bytesFromB64 = (b64) => {
+                const bin = atob(b64);
+                const arr = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+                return arr.buffer;
+            };
+            const ascii = (s) => {
+                const arr = new Uint8Array(s.length);
+                for (let i = 0; i < s.length; i++) arr[i] = s.charCodeAt(i) & 0xff;
+                return arr.buffer;
+            };
+            const sniff = (buf, ct) => {
+                const r = fmt.validateAudioPayload(buf, ct);
+                return r.ok ? { ok: true, container: r.container }
+                            : { ok: false, reason: r.reason, msg: r.message };
+            };
+            out.sniff = {
+                htmlBody:  sniff(ascii('<!DOCTYPE html><html><body>x</body></html>'), 'text/html'),
+                htmlMagicNoType: sniff(ascii('<!DOCTYPE html><html>'), null),
+                // EF BB BF + spaces + "<!DOCTYPE html>"
+                bomHtml:   sniff(bytesFromB64('77u/ICA8IURPQ1RZUEUgaHRtbD4='), null),
+                // UTF-16LE BOM + "<!DOCTYPE" — must not be mistaken for MP3 sync
+                utf16Html: sniff(bytesFromB64('//48ACEARABPAEMAVABZAFAARQA='), null),
+                m3u8Body:  sniff(ascii('#EXTM3U\\n#EXT-X-VERSION:3\\n#EXTINF:10,\\n'), null),
+                m3u8Type:  sniff(ascii('anything at all here'), 'application/vnd.apple.mpegurl'),
+                jsonBody:  sniff(ascii('{"error":"not available in your region"}'), null),
+                wav:       sniff(bytesFromB64('UklGRiQAAABXQVZFZm10IA=='), null),
+                ogg:       sniff(bytesFromB64('T2dnUwACAAAAAAAAAAAAAA=='), null),
+                flac:      sniff(bytesFromB64('ZkxhQwAAACISABIA'), null),
+                m4a:       sniff(bytesFromB64('AAAAIGZ0eXBNNEEg'), null),
+                id3:       sniff(bytesFromB64('SUQzBAAAAAAAAAAAAAAAAA=='), null),
+                mp3sync:   sniff(bytesFromB64('//uQZAAAAAAAAAAA'), null),
+                aac:       sniff(bytesFromB64('//FQgAAAAAAAAAAA'), null),
+                webm:      sniff(bytesFromB64('GkXfowEAAAAAAAAA'), null),
+                short:     sniff(ascii('ab'), null),
+            };
+            out.pageUrl = {
+                soundcloud: fmt.describeUnsupportedPageUrl('https://soundcloud.com/artist/track'),
+                scSub:      fmt.describeUnsupportedPageUrl('https://www.soundcloud.com/a/b'),
+                youtube:    fmt.describeUnsupportedPageUrl('https://www.youtube.com/watch?v=x'),
+                direct:     fmt.describeUnsupportedPageUrl('https://cdn.example.com/a/track.mp3'),
+                sndcdn:     fmt.describeUnsupportedPageUrl('https://cf-media.sndcdn.com/abc.128.mp3?x=1'),
+            };
+            return out;
+        }"""
+        )
+
+        # A web page must be rejected by the *gate*, never by the decoder.
+        for label, key in [("HTML page", "page"), ("captcha/403 page", "captcha")]:
+            r = validation[key]
+            check(f"{label} is rejected before decodeAudioData",
+                  r["ok"] is False and r["decodeCalls"] == 0,
+                  json.dumps(r))
+            check(f"{label} explains it was a web page",
+                  "web page" in r.get("msg", "").lower() and "(HTML)" in r.get("msg", ""),
+                  r.get("msg", ""))
+
+        check("HLS .m3u8 playlist is rejected with playlist guidance",
+              validation["playlist"]["ok"] is False
+              and validation["playlist"]["decodeCalls"] == 0
+              and "playlist" in validation["playlist"].get("msg", "").lower(),
+              json.dumps(validation["playlist"]))
+
+        check("JSON error body is rejected before decodeAudioData",
+              validation["json"]["ok"] is False
+              and validation["json"]["decodeCalls"] == 0
+              and "json" in validation["json"].get("msg", "").lower(),
+              json.dumps(validation["json"]))
+
+        check("HTML mislabelled as audio/mpeg is caught by magic bytes",
+              validation["mislabelled"]["ok"] is False
+              and validation["mislabelled"]["decodeCalls"] == 0
+              and "(HTML)" in validation["mislabelled"].get("msg", ""),
+              json.dumps(validation["mislabelled"]))
+
+        check("a real WAV passes validation and decodes",
+              validation["valid"]["ok"] is True
+              and validation["valid"]["buffer"] is True
+              and validation["valid"]["decodeCalls"] == 1,
+              json.dumps(validation["valid"]))
+
+        # The three failure classes must be distinguishable, not one generic text.
+        check("network/CORS failure is reported distinctly from a bad payload",
+              validation["missing"]["ok"] is False
+              and "not found" in validation["missing"].get("msg", "").lower(),
+              validation["missing"].get("msg", ""))
+        check("server error is reported distinctly",
+              validation["boom"]["ok"] is False
+              and "unavailable" in validation["boom"].get("msg", "").lower(),
+              validation["boom"].get("msg", ""))
+
+        sniff = validation["sniff"]
+        check("magic bytes: HTML detected even without a Content-Type",
+              sniff["htmlMagicNoType"]["ok"] is False
+              and sniff["htmlMagicNoType"]["reason"] == "html",
+              json.dumps(sniff["htmlMagicNoType"]))
+        check("magic bytes: UTF-8 BOM before markup still detected as HTML",
+              sniff["bomHtml"]["ok"] is False and sniff["bomHtml"]["reason"] == "html",
+              json.dumps(sniff["bomHtml"]))
+        check("magic bytes: UTF-16 HTML page not mistaken for MP3",
+              sniff["utf16Html"]["ok"] is False and sniff["utf16Html"]["reason"] == "html",
+              json.dumps(sniff["utf16Html"]))
+        check("magic bytes: #EXTM3U body detected as a playlist",
+              sniff["m3u8Body"]["ok"] is False and sniff["m3u8Body"]["reason"] == "playlist",
+              json.dumps(sniff["m3u8Body"]))
+        check("Content-Type: application/vnd.apple.mpegurl rejected",
+              sniff["m3u8Type"]["ok"] is False and sniff["m3u8Type"]["reason"] == "playlist",
+              json.dumps(sniff["m3u8Type"]))
+        check("magic bytes: JSON body detected",
+              sniff["jsonBody"]["ok"] is False and sniff["jsonBody"]["reason"] == "json",
+              json.dumps(sniff["jsonBody"]))
+        check("magic bytes: WAV/OGG/FLAC/M4A/ID3/MP3-sync/AAC/WebM all recognised",
+              all(sniff[k]["ok"] for k in ("wav", "ogg", "flac", "m4a", "id3", "mp3sync", "aac", "webm")),
+              json.dumps({k: sniff[k] for k in ("wav", "ogg", "flac", "m4a", "id3", "mp3sync", "aac", "webm")}))
+        check("a truncated payload is rejected as unsupported",
+              sniff["short"]["ok"] is False and sniff["short"]["reason"] == "unsupported",
+              json.dumps(sniff["short"]))
+
+        page_url = validation["pageUrl"]
+        check("SoundCloud track page is recognised as a non-streamable page",
+              "soundcloud" in page_url["soundcloud"].lower()
+              and "cannot be streamed directly" in page_url["soundcloud"],
+              page_url["soundcloud"])
+        check("www. SoundCloud page is also recognised", page_url["scSub"] is not None)
+        check("YouTube/Spotify pages get page guidance", page_url["youtube"] is not None)
+        check("direct audio URLs are NOT flagged as pages",
+              page_url["direct"] is None and page_url["sndcdn"] is None,
+              json.dumps(page_url))
+
+        # ── 25. SoundCloud page URL: inline message + toast, no network call ──
+        sc_requests = []
+        page.on(
+            "request",
+            lambda r: sc_requests.append(r.url)
+            if ("soundcloud" in r.url or "audio-proxy" in r.url) else None,
+        )
+        page.goto(BASE, wait_until="load")
+        page.wait_for_timeout(2000)
+        page.fill("input[type=url]", "https://soundcloud.com/artist/some-track")
+        page.click("button[type=submit]")
+        page.wait_for_timeout(1500)
+        sc_body = page.inner_text("body")
+        sc_toasts = page.evaluate(
+            """() => Array.from(document.querySelectorAll('[data-sonner-toast]'))
+                .map(t => t.innerText)"""
+        )
+        check("SoundCloud page URL shows an immediate inline explanation",
+              "cannot be streamed directly" in sc_body,
+              sc_body[:160])
+        check("SoundCloud page URL also raises a toast",
+              any("cannot be streamed directly" in t for t in sc_toasts),
+              json.dumps(sc_toasts))
+        check("SoundCloud page URL never reaches the network or the proxy",
+              len(sc_requests) == 0,
+              json.dumps(sc_requests[:3]))
+
+        # ── 26. Firebase is safe whether or not it is configured ──────────────
         # EchoLab must be a 100% local studio out of the box. These checks are
         # mode-adaptive: the invariant (no crash, handles match the flag) is
         # asserted always, and the mode-specific UX is asserted for whichever

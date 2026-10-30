@@ -30,3 +30,7 @@ pnpm-debug.log*
 
 # Replit specific (not needed outside Replit)
 .replit-artifact/
+
+# Python
+__pycache__/
+*.pyc
