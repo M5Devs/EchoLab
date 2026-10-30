@@ -23,7 +23,8 @@ export function URLStream() {
       });
       setUrl('');
     } catch (err) {
-      setError('Failed to load URL. It might be blocked by CORS.');
+      // loadTrack already surfaced a toast; keep the inline hint too.
+      setError(err instanceof Error ? err.message : 'Track unavailable or geo-restricted.');
     } finally {
       setIsLoading(false);
     }

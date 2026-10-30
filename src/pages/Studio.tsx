@@ -8,6 +8,7 @@ import { URLStream } from '../components/URLStream';
 import { ParametricEQ } from '../components/ParametricEQ';
 import { Compressor } from '../components/Compressor';
 import { WaveformEditor } from '../components/WaveformEditor';
+import { StudioFxRackPanel } from '../components/StudioFxRackPanel';
 import { useAudio } from '../contexts/AudioContext';
 
 export default function Studio() {
@@ -54,7 +55,9 @@ export default function Studio() {
         {/* Right Col: Advanced Effects */}
         <div className="lg:col-span-2 flex flex-col gap-6">
           <EffectsPanel />
-          
+
+          <StudioFxRackPanel />
+
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
             <div className="glass-panel p-5 rounded-xl">
               <ParametricEQ />

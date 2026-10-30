@@ -3,11 +3,13 @@ import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { defineConfig } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
+import { audioProxyPlugin } from './tools/devAudioProxy';
 
 export default defineConfig({
   plugins: [
     react(),
     tailwindcss(),
+    audioProxyPlugin(),
     VitePWA({
       registerType: 'autoUpdate',
       includeAssets: ['favicon.svg', 'favicon.png', 'robots.txt'],

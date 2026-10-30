@@ -9,6 +9,8 @@ import { User, onAuthStateChanged } from 'firebase/auth';
 import { toast } from 'sonner';
 import {
   auth,
+  isFirebaseConfigured,
+  CLOUD_DISABLED_MESSAGE,
   signInWithGoogle,
   signInWithGithub,
   signInWithEmail,
@@ -39,6 +41,8 @@ type FirebaseContextType = {
   user: User | null;
   authLoading: boolean;
   isAnonymous: boolean;
+  /** True when Firebase is not configured, so only local features are available. */
+  isOfflineMode: boolean;
   cloudProjects: CloudProject[];
   cloudLoading: boolean;
 
@@ -66,13 +70,19 @@ type FirebaseContextType = {
 
 const FirebaseContext = createContext<FirebaseContextType | null>(null);
 
+/** Gentle, non-blocking notice used whenever a cloud action is unavailable. */
+const notifyOffline = () => toast.info(CLOUD_DISABLED_MESSAGE);
+
 export function FirebaseProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser]               = useState<User | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
+  // When there is no backend there is nothing to wait for, so never show a
+  // spinner: the auth listener below would never fire to clear it.
+  const [authLoading, setAuthLoading] = useState(isFirebaseConfigured);
   const [cloudProjects, setCloudProjects] = useState<CloudProject[]>([]);
   const [cloudLoading, setCloudLoading]   = useState(false);
 
   useEffect(() => {
+    if (!isFirebaseConfigured || !auth) return;
     const unsub = onAuthStateChanged(auth, (u) => {
       setUser(u);
       setAuthLoading(false);
@@ -89,6 +99,12 @@ export function FirebaseProvider({ children }: { children: React.ReactNode }) {
 
   const wrap = useCallback(
     async (fn: () => Promise<unknown>, successMsg?: string) => {
+      // Every auth action funnels through here, so the offline notice is applied
+      // in one place rather than at each of the nine call sites.
+      if (!isFirebaseConfigured) {
+        notifyOffline();
+        return;
+      }
       try {
         await fn();
         if (successMsg) toast.success(successMsg);
@@ -134,6 +150,7 @@ export function FirebaseProvider({ children }: { children: React.ReactNode }) {
   );
 
   const logout = useCallback(async () => {
+    if (!isFirebaseConfigured) { notifyOffline(); return; }
     await signOut();
     toast.success('Signed out');
   }, []);
@@ -141,7 +158,7 @@ export function FirebaseProvider({ children }: { children: React.ReactNode }) {
   // ── cloud ──────────────────────────────────────────────────────────────────
 
   const refreshCloudProjects = useCallback(async () => {
-    if (!user || user.isAnonymous) return;
+    if (!isFirebaseConfigured || !user || user.isAnonymous) return;
     setCloudLoading(true);
     try {
       const projects = await listCloudProjects(user.uid);
@@ -155,6 +172,7 @@ export function FirebaseProvider({ children }: { children: React.ReactNode }) {
 
   const saveToCloud = useCallback(
     async (data: { name: string; effects: object; playlists: object[]; metadata: object | null; duration?: number }) => {
+      if (!isFirebaseConfigured) { notifyOffline(); return; }
       if (!user || user.isAnonymous) { toast.error('Sign in to save to the cloud'); return; }
       try {
         await saveCloudProject(user.uid, data);
@@ -169,6 +187,7 @@ export function FirebaseProvider({ children }: { children: React.ReactNode }) {
 
   const deleteFromCloud = useCallback(
     async (projectId: string) => {
+      if (!isFirebaseConfigured) { notifyOffline(); return; }
       if (!user) return;
       try {
         await deleteCloudProject(user.uid, projectId);
@@ -183,6 +202,7 @@ export function FirebaseProvider({ children }: { children: React.ReactNode }) {
 
   const sharePreset = useCallback(
     async (name: string, effects: object): Promise<string | null> => {
+      if (!isFirebaseConfigured) { notifyOffline(); return null; }
       if (!user || user.isAnonymous) { toast.error('Sign in to share presets'); return null; }
       try {
         const id = await fbSharePreset(user.uid, name, effects);
@@ -206,6 +226,7 @@ export function FirebaseProvider({ children }: { children: React.ReactNode }) {
         user,
         authLoading,
         isAnonymous: user?.isAnonymous ?? false,
+        isOfflineMode: !isFirebaseConfigured,
         cloudProjects,
         cloudLoading,
         login: loginWithGoogle,

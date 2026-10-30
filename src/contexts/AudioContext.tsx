@@ -1,8 +1,9 @@
 import React, { createContext, useContext, useEffect, useRef, useState, useCallback } from 'react';
-import { AudioEngine, AudioEffects, defaultEffects, Track as EngineTrack, LoudnessData } from '../utils/AudioEngine';
+import { AudioEngine, AudioEffects, Track as EngineTrack, LoudnessData } from '../utils/AudioEngine';
+import { StudioFxSettings, normalizeStudioFx } from '../utils/studioFx';
 import { parseBlob } from 'music-metadata';
 import { toast } from 'sonner';
-import { safeGetItem, safeSetItem } from '../utils/storage';
+import { safeLocalStorageGet, safeLocalStorageSet } from '../utils/storage';
 
 export type Track = {
   id: string;
@@ -22,12 +23,45 @@ export type Playlist = {
   tracks: Track[];
 };
 
+/**
+ * What actually reaches localStorage. AudioBuffers, blobs, base64 cover art and
+ * waveform peaks stay in memory; only cheap metadata is persisted so a large
+ * session can never trip `QuotaExceededError`.
+ */
+export type StoredPlaylist = {
+  id: string;
+  name: string;
+  duration: number;
+  trackCount: number;
+  createdAt: number;
+};
+
+export function toStoredPlaylists(playlists: Playlist[]): StoredPlaylist[] {
+  return playlists.map(playlist => ({
+    id: playlist.id,
+    name: playlist.name,
+    duration: playlist.tracks.reduce((sum, track) => sum + (track.duration || 0), 0),
+    trackCount: playlist.tracks.length,
+    createdAt: Number(playlist.id) || Date.now(),
+  }));
+}
+
+export function fromStoredPlaylists(stored: StoredPlaylist[]): Playlist[] {
+  return stored.map(item => ({
+    id: String(item.id),
+    name: String(item.name || 'Untitled Playlist'),
+    // Audio lives in memory only — restored playlists start empty by design.
+    tracks: [],
+  }));
+}
+
 type AudioContextType = {
   engine: AudioEngine;
   isPlaying: boolean;
   isLoaded: boolean;
   currentTrack: Track | null;
   effects: AudioEffects;
+  studioFx: StudioFxSettings;
   playlists: Playlist[];
   activePlaylistId: string | null;
   
@@ -51,6 +85,7 @@ type AudioContextType = {
   toggleShuffle: () => void;
   toggleRepeat: () => void;
   updateEffects: (effects: Partial<AudioEffects>) => void;
+  updateStudioFx: (fx: Partial<StudioFxSettings>) => void;
   updateMetadata: (updates: Partial<Track>) => void;
   exportWav: () => Promise<Blob>;
   exportMp3: () => Promise<Blob | null>;
@@ -93,42 +128,22 @@ type AudioContextType = {
 
 const AudioContext = createContext<AudioContextType | null>(null);
 
-
-function sanitizeTrackForStorage(track: Track): Track {
-  return {
-    id: track.id,
-    name: track.name,
-    artist: track.artist,
-    album: track.album,
-    year: track.year,
-    duration: track.duration,
-  };
-}
-
-function sanitizePlaylistsForStorage(playlists: Playlist[]): Playlist[] {
-  return playlists.map(playlist => ({
-    ...playlist,
-    tracks: Array.isArray(playlist.tracks)
-      ? playlist.tracks.map(sanitizeTrackForStorage)
-      : []
-  }));
-}
-
 export function AudioProvider({ children }: { children: React.ReactNode }) {
-  const engineRef = useRef<AudioEngine>(new AudioEngine());
+  // Lazy initialiser: `useRef(new AudioEngine())` would build a throwaway engine
+  // (AudioContext, oscillators, media-stream destination, audio element) on every
+  // render, which leaks hard. Construct exactly once per mount.
+  const [engine] = useState(() => new AudioEngine());
+  const engineRef = useRef<AudioEngine>(engine);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLoaded, setIsLoaded] = useState(false);
   const [currentTrack, setCurrentTrack] = useState<Track | null>(null);
   const [effects, setEffects] = useState<AudioEffects>(engineRef.current.effects);
+  const [studioFx, setStudioFx] = useState<StudioFxSettings>(engineRef.current.studioFx);
   const [playlists, setPlaylists] = useState<Playlist[]>(() => {
     const fallback: Playlist[] = [{ id: 'default', name: 'My Tracks', tracks: [] }];
-    const saved = safeGetItem<Playlist[]>('echolab_playlists', fallback);
-    if (!Array.isArray(saved)) return fallback;
-    return saved.map(p => ({
-      id: String(p.id || Date.now()),
-      name: String(p.name || 'Untitled Playlist'),
-      tracks: Array.isArray(p.tracks) ? p.tracks.map(sanitizeTrackForStorage) : []
-    }));
+    const saved = safeLocalStorageGet<StoredPlaylist[]>('echolab_playlists', []);
+    if (!Array.isArray(saved) || saved.length === 0) return fallback;
+    return fromStoredPlaylists(saved);
   });
   const [activePlaylistId, setActivePlaylistId] = useState<string | null>('default');
   const [isShuffle, setIsShuffle] = useState(false);
@@ -150,6 +165,7 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
     setIsPlaying(eng.isPlaying);
     setIsLoaded(!!eng.buffer);
     setEffects(JSON.parse(JSON.stringify(eng.effects)));
+    setStudioFx(normalizeStudioFx(eng.studioFx));
     setTracks([...eng.tracks]);
     setIsRecording(eng.isRecording);
     setUndoCount(eng.historyIndex);
@@ -312,6 +328,16 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
     };
   }, [updateState, activePlaylistId, currentTrack, playlists, loadTrack]);
 
+  // Release the AudioContext, oscillators, FX rack and hidden bridge element on
+  // real unmount only. This must not live in the engine-wiring effect above,
+  // whose cleanup also runs on every dependency change.
+  useEffect(() => {
+    const engine = engineRef.current;
+    return () => {
+      engine.dispose();
+    };
+  }, []);
+
   useEffect(() => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       if (isLoaded || tracks.length > 0) {
@@ -328,11 +354,14 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
   }, [isLoaded, tracks.length]);
 
   useEffect(() => {
-    const sanitized = sanitizePlaylistsForStorage(playlists);
-    safeSetItem('echolab_playlists', sanitized);
+    safeLocalStorageSet('echolab_playlists', toStoredPlaylists(playlists));
   }, [playlists]);
 
   // ── Media Session Integration ──────────────────────────────────────────────
+  // Drives the Android notification drawer, lock screen and Bluetooth/headset
+  // buttons. The master bus already feeds a MediaStreamAudioDestination that a
+  // hidden <audio> element plays (see AudioEngine), which is what keeps the OS
+  // transport alive while the Web Audio graph does the actual processing.
   useEffect(() => {
     if (!('mediaSession' in navigator)) return;
 
@@ -344,90 +373,100 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
             { src: '/pwa-512x512.png', sizes: '512x512', type: 'image/png' },
           ];
 
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: currentTrack.name || 'Untitled Track',
-        artist: 'EchoLab Local Studio',
-        album: 'In-Memory Session',
-        artwork,
-      });
+      try {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: currentTrack.name || 'Untitled Track',
+          artist: currentTrack.artist || 'EchoLab Studio',
+          album: currentTrack.album || 'In-Memory Session',
+          artwork,
+        });
+      } catch (e) {
+        console.warn('MediaSession metadata failed:', e);
+      }
     } else {
       navigator.mediaSession.metadata = null;
     }
   }, [currentTrack]);
 
+  // Keep playbackState and position in sync; both are polled from the engine
+  // because playback can advance without React re-rendering.
   useEffect(() => {
     if (!('mediaSession' in navigator)) return;
 
-    navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+    const sync = () => {
+      const eng = engineRef.current;
+      const speed = eng.effects.speed || 1;
+      const duration = eng.getDuration() / speed;
+      const position = Math.min(eng.getCurrentTime() / speed, duration || 0);
 
-    if (isLoaded && engineRef.current) {
-      const duration = engineRef.current.getDuration() / (engineRef.current.effects.speed || 1);
-      const position = Math.min(
-        engineRef.current.getCurrentTime() / (engineRef.current.effects.speed || 1),
-        duration || 0
-      );
+      try {
+        navigator.mediaSession.playbackState = eng.isPlaying ? 'playing' : 'paused';
+      } catch (e) {
+        /* playbackState is read-only on some engines */
+      }
+
       if (
         duration > 0 &&
-        !isNaN(duration) &&
-        !isNaN(position) &&
-        'setPositionState' in navigator.mediaSession
+        Number.isFinite(duration) &&
+        Number.isFinite(position) &&
+        typeof navigator.mediaSession.setPositionState === 'function'
       ) {
         try {
           navigator.mediaSession.setPositionState({
             duration,
-            playbackRate: engineRef.current.effects.speed || 1,
-            position,
+            playbackRate: speed,
+            position: Math.max(0, position),
           });
         } catch (e) {
-          console.warn('MediaSession setPositionState failed:', e);
+          /* some browsers reject certain rate/position combinations */
         }
       }
-    }
+    };
+
+    sync();
+    const interval = window.setInterval(sync, 1000);
+    return () => window.clearInterval(interval);
   }, [isPlaying, isLoaded]);
 
+  // Action handlers — these are what headset and lock-screen buttons dispatch.
   useEffect(() => {
     if (!('mediaSession' in navigator)) return;
+
+    const seekBy = (delta: number) => {
+      const eng = engineRef.current;
+      const speed = eng.effects.speed || 1;
+      const duration = eng.getDuration() / speed;
+      const next = Math.min(Math.max(0, eng.getCurrentTime() / speed + delta), duration || 0);
+      eng.seek(next * speed);
+    };
 
     const actionHandlers: [MediaSessionAction, MediaSessionActionHandler][] = [
       [
         'play',
         () => {
           engineRef.current.resumeContext().then(() => {
-            if (!engineRef.current.isPlaying) {
-              engineRef.current.play();
-            }
+            if (!engineRef.current.isPlaying) engineRef.current.play();
           });
-        },
-      ],
-      [
-        'previoustrack',
-        () => {
-          playPreviousTrack();
-        },
-      ],
-      [
-        'nexttrack',
-        () => {
-          playNextTrack();
         },
       ],
       [
         'pause',
         () => {
-          if (engineRef.current.isPlaying) {
-            engineRef.current.pause();
-          }
+          if (engineRef.current.isPlaying) engineRef.current.pause();
         },
       ],
       [
         'seekto',
         (details) => {
-          if (details.seekTime !== undefined) {
-            const actualTime = details.seekTime * (engineRef.current.effects.speed || 1);
-            engineRef.current.seek(actualTime);
-          }
+          if (details.seekTime === undefined) return;
+          const speed = engineRef.current.effects.speed || 1;
+          engineRef.current.seek(details.seekTime * speed);
         },
       ],
+      ['seekforward', (details) => seekBy(details.seekOffset ?? 10)],
+      ['seekbackward', (details) => seekBy(-(details.seekOffset ?? 10))],
+      ['previoustrack', () => { playPreviousTrack(); }],
+      ['nexttrack', () => { playNextTrack(); }],
     ];
 
     for (const [action, handler] of actionHandlers) {
@@ -445,7 +484,7 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
         } catch (e) {}
       }
     };
-  }, []);
+  }, [playNextTrack, playPreviousTrack]);
 
 
   const togglePlay = () => {
@@ -463,6 +502,10 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
 
   const updateEffects = (newEffects: Partial<AudioEffects>) => {
     engineRef.current.applyEffects(newEffects);
+  };
+
+  const updateStudioFx = (fx: Partial<StudioFxSettings>) => {
+    engineRef.current.applyStudioFx(fx);
   };
 
   const updateMetadata = (updates: Partial<Track>) => {
@@ -565,8 +608,15 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
 
   const loadProject = async (id: string) => {
     const proj = await engineRef.current.loadProject(id);
-    if (proj?.playlists) {
-      setPlaylists(proj.playlists);
+    if (proj?.playlists && Array.isArray(proj.playlists)) {
+      // Local projects store full playlists; cloud projects store lightweight
+      // metadata. Normalise both into the in-memory Playlist shape.
+      const restored: Playlist[] = proj.playlists.map((p: any) => ({
+        id: String(p.id),
+        name: String(p.name || 'Untitled Playlist'),
+        tracks: Array.isArray(p.tracks) ? p.tracks : [],
+      }));
+      setPlaylists(restored.length > 0 ? restored : [{ id: 'default', name: 'My Tracks', tracks: [] }]);
     }
   };
 
@@ -580,9 +630,9 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
   return (
     <AudioContext.Provider value={{
       engine: engineRef.current,
-      isPlaying, isLoaded, currentTrack, effects, playlists, activePlaylistId,
+      isPlaying, isLoaded, currentTrack, effects, studioFx, playlists, activePlaylistId,
       tracks, isRecording, undoCount, redoCount, projects, loudnessData, bpm, isShuffle, isRepeat,
-      togglePlay, stop, seek, loadTrack, playNextTrack, playPreviousTrack, toggleShuffle, toggleRepeat, updateEffects, updateMetadata, exportWav, exportMp3,
+      togglePlay, stop, seek, loadTrack, playNextTrack, playPreviousTrack, toggleShuffle, toggleRepeat, updateEffects, updateStudioFx, updateMetadata, exportWav, exportMp3,
       createPlaylist, addTrackToPlaylist, removeTrackFromPlaylist, reorderPlaylist, setActivePlaylist: setActivePlaylistId,
       undo, redo, trim, reverse, normalize, setLoopRegion, clearLoop,
       addMixerTrack, removeMixerTrack, setTrackGain, setTrackPan, muteTrack, soloTrack,
