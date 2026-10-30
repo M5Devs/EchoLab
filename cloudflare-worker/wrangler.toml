@@ -1,0 +1,8 @@
+name = "echolab-audio-proxy"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# Optional: pin the worker to a custom route instead of the workers.dev domain.
+# [[routes]]
+# pattern = "audio.example.com/*"
+# custom_domain = true

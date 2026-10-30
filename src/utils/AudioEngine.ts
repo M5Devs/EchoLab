@@ -1,6 +1,13 @@
 import { audioBufferToWav } from './audioBufferToWav';
 import lamejs from 'lamejs';
 import { openDB, DBSchema, IDBPDatabase } from 'idb';
+import {
+  StudioFxChain,
+  StudioFxSettings,
+  defaultStudioFx,
+  normalizeStudioFx,
+} from './studioFx';
+import { fetchAudioWithProxy } from './audioProxy';
 
 export type EQBandType = 'lowshelf' | 'peaking' | 'highshelf' | 'lowpass' | 'highpass';
 
@@ -92,6 +99,7 @@ interface EchoLabDB extends DBSchema {
       savedAt: number;
       duration?: number;
       effects: AudioEffects;
+      studioFx?: StudioFxSettings;
       playlists: any[];
     };
   };
@@ -128,6 +136,10 @@ export class AudioEngine {
   tracks: Track[] = [];
 
   effects: AudioEffects = JSON.parse(JSON.stringify(defaultEffects));
+
+  /** Studio FX rack (echo, reverb, saturation, widener, chorus). */
+  studioFx: StudioFxSettings = normalizeStudioFx(defaultStudioFx);
+  private studioFxChain: StudioFxChain | null = null;
 
   isPlaying = false;
   startTime = 0;
@@ -202,11 +214,21 @@ export class AudioEngine {
 
     this.audioBridge = new Audio();
     this.audioBridge.crossOrigin = 'anonymous';
+    // Deliberately NOT muted: a muted element makes Chrome Android drop the OS
+    // media notification, which kills lock-screen / headset controls.
     this.audioBridge.muted = false;
+    this.audioBridge.setAttribute('playsinline', 'true');
+    this.audioBridge.preload = 'none';
 
     try {
       this.mediaStreamDestination = this.ctx.createMediaStreamDestination();
       this.audioBridge.srcObject = this.mediaStreamDestination.stream;
+      // Some browsers only keep the element's media session alive when it is
+      // attached to the document.
+      if (typeof document !== 'undefined' && document.body && !this.audioBridge.isConnected) {
+        this.audioBridge.style.display = 'none';
+        document.body.appendChild(this.audioBridge);
+      }
     } catch (e) {
       console.warn('createMediaStreamDestination failed, using silent WAV bridge fallback:', e);
       this.mediaStreamDestination = null as any;
@@ -265,23 +287,10 @@ export class AudioEngine {
   }
 
   async loadUrl(url: string) {
-    // try direct fetch first, fallback to CORS proxy
-    const tryFetch = async (target: string) => {
-      const res = await fetch(target);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return res.arrayBuffer();
-    };
-
-    let arrayBuffer: ArrayBuffer;
-    try {
-      arrayBuffer = await tryFetch(url);
-    } catch {
-      try {
-        arrayBuffer = await tryFetch(`https://corsproxy.io/?${encodeURIComponent(url)}`);
-      } catch {
-        throw new Error('Could not load audio — the server may not allow cross-origin requests.');
-      }
-    }
+    // Direct fetch first; on CORS failure the Cloudflare Worker proxy relays the
+    // stream (Range-aware, so scrubbing still works).
+    const response = await fetchAudioWithProxy(url);
+    const arrayBuffer = await response.arrayBuffer();
     await this.loadBuffer(arrayBuffer);
   }
 
@@ -432,31 +441,45 @@ export class AudioEngine {
       this.source.detune.value = this.effects.pitch * 100;
     }
 
-    this.highpassNode.frequency.value = this.effects.highpass;
-    this.lowpassNode.frequency.value = this.effects.lowpass;
-    this.bassNode.gain.value = this.effects.bass;
-    this.trebleNode.gain.value = this.effects.treble;
+    // Smooth ramps avoid the zipper noise / clicks a raw `.value =` write causes
+    // when a knob is dragged mid-playback.
+    const ramp = (param: AudioParam, value: number) => {
+      if (!Number.isFinite(value)) return;
+      try {
+        param.setTargetAtTime(value, this.ctx.currentTime, 0.02);
+      } catch (e) {
+        param.value = value;
+      }
+    };
 
-    this.effects.eqBands.forEach((band, i) => {
+    ramp(this.highpassNode.frequency, this.effects.highpass);
+    ramp(this.lowpassNode.frequency, this.effects.lowpass);
+    ramp(this.bassNode.gain, this.effects.bass);
+    ramp(this.trebleNode.gain, this.effects.treble);
+
+    (this.effects.eqBands ?? []).forEach((band, i) => {
       if (this.eqNodes[i]) {
         this.eqNodes[i].type = band.type;
-        this.eqNodes[i].frequency.value = band.freq;
-        this.eqNodes[i].gain.value = band.gain;
-        this.eqNodes[i].Q.value = band.q;
+        ramp(this.eqNodes[i].frequency, band.freq);
+        ramp(this.eqNodes[i].gain, band.gain);
+        ramp(this.eqNodes[i].Q, band.q);
       }
     });
 
     this.distortionNode.curve = this.effects.distortion > 0 ? this.makeDistortionCurve(this.effects.distortion) : null;
-    this.delayNode.delayTime.value = this.effects.delay / 1000;
-    this.pannerLfoGain.gain.value = this.effects.pan8D;
+    ramp(this.delayNode.delayTime, this.effects.delay / 1000);
+    ramp(this.pannerLfoGain.gain, this.effects.pan8D);
 
-    this.compressorNode.threshold.value = this.effects.compressor.threshold;
-    this.compressorNode.ratio.value = this.effects.compressor.ratio;
-    this.compressorNode.attack.value = this.effects.compressor.attack;
-    this.compressorNode.release.value = this.effects.compressor.release;
-    this.compressorNode.knee.value = this.effects.compressor.knee;
+    const comp = this.effects.compressor;
+    if (comp) {
+      ramp(this.compressorNode.threshold, comp.threshold);
+      ramp(this.compressorNode.ratio, comp.ratio);
+      ramp(this.compressorNode.attack, comp.attack);
+      ramp(this.compressorNode.release, comp.release);
+      ramp(this.compressorNode.knee, comp.knee);
+    }
 
-    this.volumeNode.gain.value = this.effects.volume;
+    ramp(this.volumeNode.gain, this.effects.volume);
     this.onStateChange();
   }
 
@@ -506,9 +529,56 @@ export class AudioEngine {
 
     this.pannerNode.connect(this.compressorNode);
     this.compressorNode.connect(this.volumeNode);
-    this.volumeNode.connect(this.analyser);
-    this.analyser.connect(this.mediaStreamDestination);
+
+    // The studio FX rack sits post-compressor, pre-analysis, so the visualizer
+    // and the exported file both reflect what the user hears.
+    this.mountStudioFx();
   }
+
+  /** (Re)build and insert the studio FX rack into the live master chain. */
+  private mountStudioFx() {
+    if (this.studioFxChain) {
+      this.studioFxChain.dispose();
+      this.studioFxChain = null;
+    }
+    try {
+      this.volumeNode.disconnect();
+    } catch (e) {}
+
+    const chain = new StudioFxChain(this.ctx, this.studioFx, true);
+    this.volumeNode.connect(chain.input);
+    chain.output.connect(this.analyser);
+
+    // Preferred route: a MediaStream feeding the hidden <audio> element, which
+    // is what keeps the mobile OS transport (notification, lock screen, headset
+    // buttons) alive. If the browser has no MediaStreamAudioDestination we fall
+    // back to the plain hardware output so playback is still audible.
+    if (this.mediaStreamDestination) {
+      this.analyser.connect(this.mediaStreamDestination);
+    } else {
+      this.analyser.connect(this.ctx.destination);
+    }
+    this.studioFxChain = chain;
+  }
+
+  /**
+   * Apply studio FX settings. Smooth parameter ramps keep knob moves click-free;
+   * bypassing a unit is a mix ramp, never a rewire, so toggles are silent.
+   */
+  applyStudioFx(next: Partial<StudioFxSettings>) {
+    this.studioFx = normalizeStudioFx({
+      echo: { ...this.studioFx.echo, ...(next.echo ?? {}) },
+      reverb: { ...this.studioFx.reverb, ...(next.reverb ?? {}) },
+      saturation: { ...this.studioFx.saturation, ...(next.saturation ?? {}) },
+      widener: { ...this.studioFx.widener, ...(next.widener ?? {}) },
+      chorus: { ...this.studioFx.chorus, ...(next.chorus ?? {}) },
+    });
+    if (this.studioFxChain) {
+      this.studioFxChain.setSettings(this.studioFx);
+    }
+    this.onStateChange();
+  }
+
 
   play() {
     if (!this.buffer && this.tracks.length === 0) return;
@@ -961,7 +1031,13 @@ export class AudioEngine {
     // playbackRate slows/speeds the source but the OfflineAudioContext keeps rendering
     // until its buffer is full — so we size it to the stretched duration
     const stretchedSamples = Math.ceil((maxDur / speed) * sr);
-    const tailSamples      = ((this.effects.reverb > 0 ? 3 : 0) + (this.effects.delay > 0 ? 2 : 0)) * sr;
+    const fxReverbTail = this.studioFx.reverb.enabled ? this.studioFx.reverb.decay + 0.5 : 0;
+    const fxEchoTail = this.studioFx.echo.enabled ? this.studioFx.echo.time * 8 : 0;
+    const tailSamples      = (
+      (this.effects.reverb > 0 ? 3 : 0) +
+      (this.effects.delay > 0 ? 2 : 0) +
+      Math.min(fxReverbTail + fxEchoTail, 12)
+    ) * sr;
     const totalSamples     = stretchedSamples + Math.ceil(tailSamples);
 
     const offlineCtx = new (window.OfflineAudioContext || (window as any).webkitOfflineAudioContext)(
@@ -1057,7 +1133,11 @@ export class AudioEngine {
 
     pannerNode.connect(compressorNode);
     compressorNode.connect(volumeNode);
-    volumeNode.connect(offlineCtx.destination);
+
+    // Mirror the live master chain: volume → studio FX rack → destination.
+    const fxChain = new StudioFxChain(offlineCtx, this.studioFx, false);
+    volumeNode.connect(fxChain.input);
+    fxChain.output.connect(offlineCtx.destination);
 
     // Main editor buffer
     if (this.buffer) {
@@ -1133,6 +1213,7 @@ export class AudioEngine {
       name,
       savedAt: Date.now(),
       effects: this.effects,
+      studioFx: this.studioFx,
       playlists
     };
     if (this.buffer) {
@@ -1150,6 +1231,9 @@ export class AudioEngine {
     if (proj.effects) {
       this.applyEffects(proj.effects);
     }
+    if (proj.studioFx) {
+      this.applyStudioFx(proj.studioFx);
+    }
     return proj;
   }
 
@@ -1162,6 +1246,41 @@ export class AudioEngine {
   async deleteProject(id: string) {
     const db = await this.dbPromise;
     await db.delete('projects', id);
+  }
+
+  /**
+   * Tear the engine down completely: stop sources, drop the FX rack, detach the
+   * hidden bridge element and close the AudioContext. Without this the
+   * AudioContext, its oscillators and the MediaStream destination survive every
+   * remount, which is a hard leak on hot-reload and in tests.
+   */
+  dispose() {
+    try {
+      this.stop();
+    } catch (e) {}
+
+    if (this.studioFxChain) {
+      this.studioFxChain.dispose();
+      this.studioFxChain = null;
+    }
+
+    try {
+      this.pannerLfo.stop();
+    } catch (e) {}
+
+    try {
+      this.audioBridge.pause();
+      this.audioBridge.srcObject = null;
+      this.audioBridge.remove();
+    } catch (e) {}
+
+    try {
+      this.mediaStreamDestination?.disconnect();
+    } catch (e) {}
+
+    try {
+      void this.ctx.close();
+    } catch (e) {}
   }
 }
 

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useAudio } from '../contexts/AudioContext';
+import { useAudio, toStoredPlaylists } from '../contexts/AudioContext';
 import { useFirebase } from '../hooks/useFirebase';
 import {
   Download, ArchiveX, FolderOpen, Save, FileArchive,
@@ -15,7 +15,7 @@ function formatDate(val: any): string {
 
 export function ProjectsPanel() {
   const { projects, saveProject, loadProject, deleteProject, effects, playlists, currentTrack } = useAudio();
-  const { user, cloudProjects, cloudLoading, login, saveToCloud, deleteFromCloud, refreshCloudProjects } = useFirebase();
+  const { user, cloudProjects, cloudLoading, login, saveToCloud, deleteFromCloud, refreshCloudProjects, isOfflineMode } = useFirebase();
 
   const [newProjectName, setNewProjectName] = useState('');
   const [tab, setTab] = useState<'local' | 'cloud'>('local');
@@ -49,7 +49,9 @@ export function ProjectsPanel() {
     await saveToCloud({
       name: newProjectName,
       effects: effects as object,
-      playlists: playlists as object[],
+      // Strip File/cover-art/base64 payloads — Firestore caps documents at 1 MB
+      // and the audio itself is in-memory only anyway.
+      playlists: toStoredPlaylists(playlists) as unknown as object[],
       metadata: currentTrack ? {
         name: currentTrack.name,
         artist: currentTrack.artist,
@@ -167,7 +169,16 @@ export function ProjectsPanel() {
       {/* ── Cloud projects ───────────────────────────────────────────── */}
       {tab === 'cloud' && (
         <>
-          {!user ? (
+          {isOfflineMode ? (
+            <div className="flex-1 py-24 flex flex-col items-center justify-center text-muted-foreground gap-4 border border-dashed border-white/10 rounded-xl">
+              <CloudOff className="w-12 h-12 opacity-40" />
+              <p className="text-sm">Cloud sync is unavailable</p>
+              <p className="text-xs opacity-70 max-w-sm text-center">
+                EchoLab is running in local offline mode. Projects, playlists and
+                exports are saved on this device and work exactly as normal.
+              </p>
+            </div>
+          ) : !user ? (
             <div className="flex-1 py-24 flex flex-col items-center justify-center text-muted-foreground gap-5 border border-dashed border-white/10 rounded-xl">
               <CloudOff className="w-12 h-12 opacity-40" />
               <p className="text-sm">Sign in to access your cloud projects</p>

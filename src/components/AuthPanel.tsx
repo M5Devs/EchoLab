@@ -1,12 +1,13 @@
 import { useState } from 'react';
 import { useFirebase } from '../hooks/useFirebase';
-import { LogOut, Loader2, Mail, Github, Chrome, User, UserPlus, RotateCcw } from 'lucide-react';
+import { CLOUD_DISABLED_MESSAGE } from '../firebase';
+import { LogOut, Loader2, Mail, Github, Chrome, User, UserPlus, RotateCcw, CloudOff } from 'lucide-react';
 
 type View = 'menu' | 'email-login' | 'email-register' | 'reset';
 
 export function AuthPanel() {
   const {
-    user, authLoading, isAnonymous,
+    user, authLoading, isAnonymous, isOfflineMode,
     loginWithGoogle, loginWithGithub,
     loginWithEmail, registerWithEmail,
     loginAsGuest, sendReset, upgradeGuest, logout,
@@ -26,6 +27,20 @@ export function AuthPanel() {
     setOpen(false);
     setView('menu');
   };
+
+  // No backend configured: make it obvious that cloud features are simply
+  // unavailable, rather than offering a sign-in that can never succeed.
+  if (isOfflineMode) {
+    return (
+      <div
+        className="flex items-center gap-2 text-xs text-muted-foreground bg-white/5 border border-white/10 px-3 py-1.5 rounded-full"
+        title={CLOUD_DISABLED_MESSAGE}
+      >
+        <CloudOff className="w-3.5 h-3.5" />
+        <span className="hidden lg:block">Local only</span>
+      </div>
+    );
+  }
 
   if (authLoading) {
     return (

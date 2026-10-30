@@ -1,5 +1,6 @@
 import React, { Component, ErrorInfo, ReactNode } from 'react';
 import { AlertTriangle, RefreshCw, Trash2 } from 'lucide-react';
+import { resetLocalCache } from '../utils/storage';
 
 interface Props {
   children: ReactNode;
@@ -29,13 +30,13 @@ export class ErrorBoundary extends Component<Props, State> {
     window.location.reload();
   };
 
-  private handleClearCacheAndReload = () => {
-    try {
-      localStorage.clear();
-      sessionStorage.clear();
-    } catch (e) {
-      console.warn('Failed to clear storage:', e);
-    }
+  /**
+   * Automated recovery: wipe every EchoLab storage key (the usual cause of a
+   * persistent crash — a corrupt or oversized cache) and reboot the app so the
+   * user is never trapped on this screen.
+   */
+  private handleResetLocalCache = () => {
+    resetLocalCache();
     this.setState({ hasError: false, error: null });
     window.location.reload();
   };
@@ -62,10 +63,10 @@ export class ErrorBoundary extends Component<Props, State> {
                 <RefreshCw className="w-4 h-4" /> Reset & Try Again
               </button>
               <button
-                onClick={this.handleClearCacheAndReload}
+                onClick={this.handleResetLocalCache}
                 className="flex-1 px-4 py-2.5 bg-white/10 hover:bg-red-500/20 text-red-300 hover:text-red-200 border border-red-500/30 font-semibold rounded-xl flex items-center justify-center gap-2 transition-all text-sm"
               >
-                <Trash2 className="w-4 h-4" /> Clear Cache & Reload
+                <Trash2 className="w-4 h-4" /> Reset Local Cache
               </button>
             </div>
           </div>
