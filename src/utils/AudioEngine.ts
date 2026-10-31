@@ -71,6 +71,79 @@ export const defaultEffects: AudioEffects = {
   }
 };
 
+/**
+ * Transport rate bounds. `effects.speed` multiplies both the rendered duration
+ * and `getCurrentTime()`, so a non-finite, zero or negative value would either
+ * throw inside `AudioParam.value` or corrupt the startTime/pauseTime math and
+ * present as playback that races or stalls. Playback rate is ONLY ever set from
+ * the user's Speed control — never from a timer or animation frame.
+ */
+export const MIN_PLAYBACK_SPEED = 0.25;
+export const MAX_PLAYBACK_SPEED = 4.0;
+
+export function sanitizeSpeed(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 1.0;
+  return Math.min(MAX_PLAYBACK_SPEED, Math.max(MIN_PLAYBACK_SPEED, n));
+}
+
+/** Semitone detune bound; ±24 keeps `detune.value = pitch * 100` in a sane range. */
+export function sanitizePitch(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(24, Math.max(-24, n));
+}
+
+/**
+ * A self-contained, genuinely silent 1 s WAV, used as the hidden keep-alive
+ * element's source.
+ *
+ * Generated rather than pasted: the obvious short literals circulating for this
+ * job are malformed (their `fmt ` chunk declares a size of 18 but carries only
+ * 16 bytes, so strict decoders reject them), and the tiniest "silent" clips
+ * carry a non-zero sample. Building the header here guarantees a well-formed
+ * 44-byte canonical PCM header followed by real zeros.
+ *
+ * Deliberately NOT a MediaStream (`srcObject`): many Android Chrome builds will
+ * not raise a media notification for a MediaStream-sourced element. The element
+ * is left unmuted (a muted element is also dropped) but carries no programme
+ * audio, so it cannot become a second live output path.
+ */
+export function silentWavDataUri(seconds = 1, sampleRate = 8000): string {
+  const samples = Math.max(1, Math.floor(seconds * sampleRate));
+  const dataBytes = samples * 2; // 16-bit mono
+  const buffer = new ArrayBuffer(44 + dataBytes);
+  const view = new DataView(buffer);
+  const write = (offset: number, text: string) => {
+    for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+  };
+  write(0, 'RIFF');
+  view.setUint32(4, 36 + dataBytes, true);
+  write(8, 'WAVE');
+  write(12, 'fmt ');
+  view.setUint32(16, 16, true); // PCM fmt chunk size
+  view.setUint16(20, 1, true);  // audioFormat = PCM
+  view.setUint16(22, 1, true);  // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byteRate
+  view.setUint16(32, 2, true);  // blockAlign
+  view.setUint16(34, 16, true); // bitsPerSample
+  write(36, 'data');
+  view.setUint32(40, dataBytes, true);
+  // Sample payload stays zero-filled.
+
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return `data:audio/wav;base64,${btoa(binary)}`;
+}
+
+/** Keep-alive element gain: audible to Android's "is this playing?" check, imperceptible to humans. */
+export const BRIDGE_VOLUME = 0.01;
+
 export interface Track {
   id: string;
   name: string;
@@ -213,28 +286,29 @@ export class AudioEngine {
 
     this.channelMerger = this.ctx.createChannelMerger(2);
 
-    this.audioBridge = new Audio();
-    this.audioBridge.crossOrigin = 'anonymous';
-    // Deliberately NOT muted: a muted element makes Chrome Android drop the OS
-    // media notification, which kills lock-screen / headset controls.
-    this.audioBridge.muted = false;
-    this.audioBridge.setAttribute('playsinline', 'true');
-    this.audioBridge.preload = 'none';
+    // Master-bus tap. Kept available for capturing the mix, but deliberately NOT
+    // wired into the default output path — see connectMasterOutput().
+    this.mediaStreamDestination = this.ctx.createMediaStreamDestination();
 
-    try {
-      this.mediaStreamDestination = this.ctx.createMediaStreamDestination();
-      this.audioBridge.srcObject = this.mediaStreamDestination.stream;
-      // Some browsers only keep the element's media session alive when it is
-      // attached to the document.
-      if (typeof document !== 'undefined' && document.body && !this.audioBridge.isConnected) {
-        this.audioBridge.style.display = 'none';
-        document.body.appendChild(this.audioBridge);
-      }
-    } catch (e) {
-      console.warn('createMediaStreamDestination failed, using silent WAV bridge fallback:', e);
-      this.mediaStreamDestination = null as any;
-      this.audioBridge.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAAAA';
-      this.audioBridge.loop = true;
+    this.audioBridge = new Audio();
+    // Deliberately NOT muted: a muted element makes Chrome Android drop the OS
+    // media notification, which kills lock-screen / headset controls. The
+    // element is kept inaudible by gain instead, never by muting.
+    this.audioBridge.muted = false;
+    this.audioBridge.volume = BRIDGE_VOLUME;
+    this.audioBridge.setAttribute('playsinline', 'true');
+    this.audioBridge.preload = 'auto';
+    this.audioBridge.loop = true;
+    // A silent, self-contained 1 s WAV — deliberately NOT `srcObject = MediaStream`.
+    // Many Android Chrome builds refuse to raise a media notification for a
+    // MediaStream-sourced element, which is precisely the lock-screen failure
+    // this bridge exists to prevent. Because the clip is silent it can never
+    // become a second audible output path alongside the Web Audio graph.
+    this.audioBridge.src = silentWavDataUri();
+
+    if (typeof document !== 'undefined' && document.body && !this.audioBridge.isConnected) {
+      this.audioBridge.style.display = 'none';
+      document.body.appendChild(this.audioBridge);
     }
 
     this.dbPromise = openDB<EchoLabDB>('echolab-projects', 1, {
@@ -448,6 +522,12 @@ export class AudioEngine {
 
   applyEffects(effects: Partial<AudioEffects>) {
     this.effects = { ...this.effects, ...effects };
+    // Transport rate is user-controlled only, and must stay within a finite,
+    // positive range: it is read back in the startTime/pauseTime arithmetic and
+    // in every seek. Clamping here (the only place `effects` is written) means
+    // no caller can push the engine into a racing or stalled transport.
+    this.effects.speed = sanitizeSpeed(this.effects.speed);
+    this.effects.pitch = sanitizePitch(this.effects.pitch);
 
     if (this.source) {
       this.source.playbackRate.value = this.effects.speed;
@@ -579,22 +659,23 @@ export class AudioEngine {
   }
 
   /**
-   * Route the analyser (the true end of the master bus) to the OS.
+   * Route the analyser (the true end of the master bus) to the speakers.
    *
-   * Preferred route: a MediaStream feeding the hidden `<audio>` element, which
-   * is what keeps the mobile OS transport (notification, lock screen, headset
-   * buttons) alive. If the browser has no MediaStreamAudioDestination we fall
-   * back to the plain hardware output so playback is still audible.
+   * Web Audio is the authoritative output path. Audio must NOT also be sent to
+   * `mediaStreamDestination` while a media element plays that stream: on Android
+   * Chrome the two output clocks drift against each other and the graph is
+   * throttled, which is heard as wow/flutter and pitch bending. The keep-alive
+   * element instead plays its own silent clip, so there is exactly one audible
+   * path (this one) and no feedback loop.
+   *
+   * `mediaStreamDestination` is retained as a master-bus tap (useful for
+   * capturing the mix) but is deliberately left out of the default output path.
    */
   private connectMasterOutput() {
     try {
       this.analyser.disconnect();
     } catch (e) {}
-    if (this.mediaStreamDestination) {
-      this.analyser.connect(this.mediaStreamDestination);
-    } else {
-      this.analyser.connect(this.ctx.destination);
-    }
+    this.analyser.connect(this.ctx.destination);
   }
 
   /**
@@ -620,14 +701,18 @@ export class AudioEngine {
     if (!this.buffer && this.tracks.length === 0) return;
     this.resumeContext();
 
+    // Start the silent keep-alive clip inside the user gesture. Web Audio (not
+    // this element) is what produces the audible output; the element exists so
+    // Android Chrome raises and retains the media notification / lock-screen
+    // transport. It must be started from a real user gesture or the browser
+    // suspends it and drops the session.
     if (this.audioBridge) {
-      this.audioBridge.play().catch(e => {
-        console.warn('AudioBridge stream play failed, trying silent WAV fallback:', e);
-        this.audioBridge.srcObject = null;
-        this.audioBridge.src = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAAAA';
-        this.audioBridge.loop = true;
-        this.audioBridge.play().catch(err => console.warn('AudioBridge fallback play failed:', err));
-      });
+      const started = this.audioBridge.play();
+      if (started && typeof started.catch === 'function') {
+        started.catch(e => {
+          console.warn('AudioBridge keep-alive play failed:', e);
+        });
+      }
     }
 
     const offset = this.pauseTime;
@@ -1224,8 +1309,10 @@ export class AudioEngine {
    */
   exportMP3(buffer: AudioBuffer, sampleRate: number): Blob {
     const channels = Math.min(Math.max(buffer.numberOfChannels, 1), 2);
-    // 320 kbps is the practical ceiling for MPEG-1 Layer III at 44.1/48 kHz.
-    const kbps = sampleRate >= 32000 ? 320 : 160;
+    // 192 kbps as specified for the export pipeline. MPEG-1 Layer III needs
+    // >= 32 kHz; below that the encoder falls back to a valid lower bitrate
+    // rather than producing a stream it cannot express.
+    const kbps = sampleRate >= 32000 ? 192 : 96;
     const encoder = new Mp3Encoder(channels, sampleRate, kbps);
 
     const left = buffer.getChannelData(0);

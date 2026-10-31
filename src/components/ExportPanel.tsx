@@ -18,26 +18,24 @@ export function ExportPanel() {
     if (!isLoaded) return;
     try {
       setIsExporting(true);
-      let blob = await getBlob();
-      let ext: 'wav' | 'mp3' = format;
-      if (!blob && format === 'mp3') {
-        // Never leave the user with a dead export button: fall back to WAV,
-        // which needs no external encoder, and say so.
-        blob = await exportWav();
-        ext = 'wav';
-        toast.warning('MP3 encoding unavailable — exported as WAV instead');
-      }
+      const blob = await getBlob();
       if (!blob) throw new Error('Export failed');
+      // Never silently substitute another format: an MP3 request must yield an
+      // MP3. If the encoder fails we surface the error instead of handing the
+      // user a WAV renamed to .mp3.
+      if (format === 'mp3' && !blob.type.includes('mpeg') && !blob.type.includes('mp3')) {
+        throw new Error(`Unexpected export container: ${blob.type}`);
+      }
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${currentTrack?.name || 'echolab-master'}.${ext}`;
+      a.download = `${currentTrack?.name || 'echolab-master'}.${format}`;
       a.click();
       URL.revokeObjectURL(url);
-      if (ext === format) toast.success(`Exported as ${ext.toUpperCase()}`);
+      toast.success(`Exported as ${format.toUpperCase()}`);
     } catch (e) {
       console.error(e);
-      toast.error('Export failed');
+      toast.error(format === 'mp3' ? 'MP3 export failed' : 'Export failed');
     } finally {
       setIsExporting(false);
     }
