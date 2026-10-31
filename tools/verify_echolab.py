@@ -336,6 +336,88 @@ def run(upstream):
               e["feedback"] == 0.9 and e["time"] == 1.5 and e["tone"] == 8000 and e["mix"] == 1,
               str(e))
 
+        # ── 5a. Transport rate must stay constant unless the user changes it ──
+        # Regression guard: nothing (timer, rAF, sync loop) may touch
+        # playbackRate.value during playback. Sample the rate and the reported
+        # position against the wall clock over a sustained stretch.
+        speed_test = page.evaluate(
+            """async () => {
+            const { AudioEngine, sanitizeSpeed, sanitizePitch } = await import('/src/utils/AudioEngine.ts');
+            const eng = new AudioEngine();
+            const sr = eng.ctx.sampleRate;
+            const n = sr * 30;                       // 30-second track, as per acceptance
+            const buf = eng.ctx.createBuffer(2, n, sr);
+            for (let i = 0; i < n; i++) {
+                const v = 0.6 * Math.sin(2 * Math.PI * 440 * i / sr);
+                buf.getChannelData(0)[i] = v;
+                buf.getChannelData(1)[i] = v;
+            }
+            eng.setBuffer(buf);
+            await eng.resumeContext();
+            eng.play();
+
+            const rates = new Set();
+            const samples = [];
+            const t0 = performance.now();
+            for (let k = 0; k < 40; k++) {           // ~4 s of wall time
+                await new Promise(r => setTimeout(r, 100));
+                if (eng.source) rates.add(eng.source.playbackRate.value);
+                samples.push([(performance.now() - t0) / 1000, eng.getCurrentTime()]);
+            }
+            const out = {
+                defaultSpeed: eng.effects.speed,
+                defaultPitch: eng.effects.pitch,
+                distinctRates: [...rates],
+            };
+            const N = samples.length;
+            let sx = 0, sy = 0, sxx = 0, sxy = 0;
+            for (const [x, y] of samples) { sx += x; sy += y; sxx += x * x; sxy += x * y; }
+            const slope = (N * sxy - sx * sy) / (N * sxx - sx * sx);
+            const intercept = (sy - slope * sx) / N;
+            out.observedSpeed = slope;
+            let maxDev = 0;
+            for (const [x, y] of samples) maxDev = Math.max(maxDev, Math.abs(y - (slope * x + intercept)));
+            out.maxDeviationSec = maxDev;
+
+            // Hostile inputs must be clamped, never allowed to corrupt transport.
+            eng.applyEffects({ speed: NaN });
+            out.nanSpeed = eng.effects.speed;
+            eng.applyEffects({ speed: 0 });
+            out.zeroSpeed = eng.effects.speed;
+            eng.applyEffects({ speed: -3 });
+            out.negativeSpeed = eng.effects.speed;
+            eng.applyEffects({ speed: 1e9 });
+            out.hugeSpeed = eng.effects.speed;
+            eng.applyEffects({ speed: 1.25, pitch: 3 });
+            out.validSpeed = eng.effects.speed;
+            out.validPitch = eng.effects.pitch;
+            out.sourceRateAfterValid = eng.source ? eng.source.playbackRate.value : null;
+            out.sanitizeSpeed = [sanitizeSpeed(NaN), sanitizeSpeed(0), sanitizeSpeed(-1),
+                                 sanitizeSpeed(Infinity), sanitizeSpeed(2), sanitizeSpeed(99)];
+            out.sanitizePitch = [sanitizePitch(NaN), sanitizePitch(Infinity), sanitizePitch(5), sanitizePitch(-99)];
+            eng.dispose();
+            return out;
+        }"""
+        )
+        check("playback rate never drifts during playback",
+              speed_test["distinctRates"] == [1.0], str(speed_test["distinctRates"]))
+        check("30s track plays at 100% speed (no wow/flutter)",
+              abs(speed_test["observedSpeed"] - 1.0) < 0.01
+              and speed_test["maxDeviationSec"] < 0.02,
+              f"speed={speed_test['observedSpeed']:.5f} dev={speed_test['maxDeviationSec']:.4f}s")
+        check("hostile speed values are clamped, transport stays valid",
+              speed_test["nanSpeed"] == 1.0 and speed_test["zeroSpeed"] == 1.0
+              and speed_test["negativeSpeed"] == 1.0 and speed_test["hugeSpeed"] == 4.0,
+              f"nan={speed_test['nanSpeed']} zero={speed_test['zeroSpeed']} "
+              f"neg={speed_test['negativeSpeed']} huge={speed_test['hugeSpeed']}")
+        check("a valid speed change still applies to the live source",
+              speed_test["validSpeed"] == 1.25 and speed_test["sourceRateAfterValid"] == 1.25,
+              f"speed={speed_test['validSpeed']} rate={speed_test['sourceRateAfterValid']}")
+        check("speed/pitch sanitizers enforce their documented ranges",
+              speed_test["sanitizeSpeed"] == [1.0, 1.0, 1.0, 1.0, 2.0, 4.0]
+              and speed_test["sanitizePitch"] == [0, 0, 5, -24],
+              f"speed={speed_test['sanitizeSpeed']} pitch={speed_test['sanitizePitch']}")
+
         # ── 5b. FX bypass must be pitch/phase transparent ────────────────────
         # Regression: the widener used to run the right channel through its
         # Haas micro-delay even when disabled, comb-filtering the centre image
@@ -626,8 +708,18 @@ def run(upstream):
                 out.mp3Size = mp3.size;
                 out.mp3Type = mp3.type;
                 const bytes = new Uint8Array(await mp3.arrayBuffer());
-                // MPEG audio frame sync is 11 set bits.
-                out.mp3FrameSync = bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0;
+                // An authentic MP3 must NOT begin with a RIFF/WAVE header: that
+                // would mean a WAV was renamed to .mp3. Accept either an MPEG
+                // frame sync (0xFF 0xEx/0xFx) or an ID3v2 tag.
+                const isRiff = bytes[0] === 0x52 && bytes[1] === 0x49
+                            && bytes[2] === 0x46 && bytes[3] === 0x46;
+                const isMpegSync = bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0;
+                const isId3 = bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33;
+                out.mp3HeaderHex = Array.from(bytes.slice(0, 4))
+                    .map(b => b.toString(16).padStart(2, '0')).join(' ');
+                out.mp3IsRiff = isRiff;
+                out.mp3ValidHeader = (isMpegSync || isId3) && !isRiff;
+                out.mp3FrameSync = isMpegSync;
                 let syncs = 0;
                 for (let i = 0; i < bytes.length - 1; i++) {
                     if (bytes[i] === 0xff && (bytes[i + 1] & 0xe0) === 0xe0) syncs++;
@@ -660,7 +752,13 @@ def run(upstream):
             const probeData = new Float32Array(engine2.analyser.fftSize);
             engine2.analyser.getFloatTimeDomainData(probeData);
             out.trackOnlyAnalyserPeak = Math.max(...Array.from(probeData).map(Math.abs));
-            out.trackOnlyBridgeStream = !!engine2.audioBridge.srcObject;
+            // The keep-alive element must be driven by its own silent clip, NOT a
+            // MediaStream: many Android Chrome builds refuse to raise a media
+            // notification for a srcObject-sourced element.
+            out.trackOnlyBridgeSrc = !!engine2.audioBridge.getAttribute('src');
+            out.trackOnlyBridgeSrcObject = !!engine2.audioBridge.srcObject;
+            out.trackOnlyBridgeVolume = engine2.audioBridge.volume;
+            out.trackOnlyBridgeLoop = engine2.audioBridge.loop;
             engine2.dispose();
 
             await engine.ctx.close();
@@ -682,11 +780,68 @@ def run(upstream):
               and engine_test["mp3DecodedSeconds"] > 0.1,
               f"size={engine_test.get('mp3Size')} syncs={engine_test.get('mp3Syncs')} "
               f"decoded={engine_test.get('mp3DecodedSeconds')} err={engine_test.get('mp3Error')}")
+        check("MP3 export is a real MP3, not a renamed WAV",
+              engine_test.get("mp3ValidHeader") is True and engine_test.get("mp3IsRiff") is False,
+              f"header={engine_test.get('mp3HeaderHex')} isRiff={engine_test.get('mp3IsRiff')}")
         check("MP3 blob is labelled audio/mpeg",
               engine_test.get("mp3Type") == "audio/mpeg", str(engine_test.get("mp3Type")))
         check("track-only session reaches the master bus (not silent)",
-              engine_test["trackOnlyAnalyserPeak"] > 1e-3 and engine_test["trackOnlyBridgeStream"] is True,
+              engine_test["trackOnlyAnalyserPeak"] > 1e-3,
               f"peak={engine_test['trackOnlyAnalyserPeak']:.4f}")
+        check("keep-alive element uses a silent clip, not a MediaStream",
+              engine_test["trackOnlyBridgeSrc"] is True
+              and engine_test["trackOnlyBridgeSrcObject"] is False
+              and engine_test["trackOnlyBridgeLoop"] is True,
+              f"src={engine_test['trackOnlyBridgeSrc']} srcObject={engine_test['trackOnlyBridgeSrcObject']}")
+        check("keep-alive element is unmuted but near-inaudible",
+              engine_test["bridgeMuted"] is False and 0 < engine_test["trackOnlyBridgeVolume"] <= 0.05,
+              f"muted={engine_test['bridgeMuted']} vol={engine_test['trackOnlyBridgeVolume']}")
+
+        # The keep-alive clip must be a real, well-formed, silent 1 s WAV. The
+        # literals commonly pasted for this job are malformed (fmt size 18 with
+        # 16 bytes of payload) and can carry a non-zero sample.
+        clip = page.evaluate(
+            """async () => {
+            const { silentWavDataUri } = await import('/src/utils/AudioEngine.ts');
+            const uri = silentWavDataUri();
+            const b64 = uri.split(',')[1];
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const dv = new DataView(bytes.buffer);
+            const tag = (o) => String.fromCharCode(bytes[o], bytes[o+1], bytes[o+2], bytes[o+3]);
+            const fmtSize = dv.getUint32(16, true);
+            const dataSize = dv.getUint32(40, true);
+            let peak = 0;
+            for (let i = 44; i + 1 < 44 + dataSize; i += 2) {
+                peak = Math.max(peak, Math.abs(dv.getInt16(i, true)));
+            }
+            // Confirm the browser itself decodes it, and to what duration.
+            const ac = new AudioContext();
+            const decoded = await ac.decodeAudioData(bytes.buffer.slice(0));
+            const seconds = decoded.duration;
+            const decodedPeak = (() => {
+                const d = decoded.getChannelData(0);
+                let p = 0; for (let i = 0; i < d.length; i++) p = Math.max(p, Math.abs(d[i]));
+                return p;
+            })();
+            await ac.close();
+            return {
+                riff: tag(0), wave: tag(8), fmt: tag(12), data: tag(36),
+                fmtSize, dataSize, peak, seconds, decodedPeak,
+                channels: decoded.numberOfChannels,
+            };
+        }"""
+        )
+        check("keep-alive clip is a well-formed WAV (fmt size 16)",
+              clip["riff"] == "RIFF" and clip["wave"] == "WAVE"
+              and clip["fmt"] == "fmt " and clip["data"] == "data"
+              and clip["fmtSize"] == 16,
+              json.dumps(clip))
+        check("keep-alive clip is silent and ~1 second long",
+              clip["peak"] == 0 and clip["decodedPeak"] == 0
+              and 0.9 < clip["seconds"] < 1.1,
+              json.dumps(clip))
 
         # ── 9. Studio FX rack panel is present in the UI ──────────────────────
         page.wait_for_timeout(300)
@@ -743,14 +898,17 @@ def run(upstream):
             return {
                 hasAudioEl: !!el,
                 audioMuted: el ? el.muted : null,
-                hasStream: el ? !!el.srcObject : false,
+                hasSrc: el ? !!el.getAttribute('src') : false,
+                hasSrcObject: el ? !!el.srcObject : false,
+                volume: el ? el.volume : null,
                 bodyHasLoadedText: document.body.innerText.includes('tone'),
             };
         }"""
         )
         check("uploaded track decoded into memory", e2e["bodyHasLoadedText"] is True)
-        check("hidden audio bridge exists with a MediaStream and is unmuted",
-              e2e["hasAudioEl"] and e2e["hasStream"] and e2e["audioMuted"] is False,
+        check("hidden keep-alive element exists, unmuted, silent clip (not a stream)",
+              e2e["hasAudioEl"] and e2e["hasSrc"] and not e2e["hasSrcObject"]
+              and e2e["audioMuted"] is False and 0 < e2e["volume"] <= 0.05,
               json.dumps(e2e))
 
         # The guard must now actually fire: beforeunload should be cancelled.
@@ -807,6 +965,25 @@ def run(upstream):
               str(ms_invoke["registered"]))
         check("every mediaSession handler runs without throwing",
               len(ms_invoke["errors"]) == 0, str(ms_invoke["errors"]))
+
+        # The handlers must actually drive playback, not merely avoid throwing.
+        # 'play' was invoked last, so the engine and the keep-alive element
+        # should both now be running and the OS state should read 'playing'.
+        ms_effect = page.evaluate(
+            """async () => {
+            await new Promise(r => setTimeout(r, 250));
+            const el = document.querySelector('audio');
+            return {
+                bridgePaused: el ? el.paused : null,
+                playbackState: navigator.mediaSession ? navigator.mediaSession.playbackState : null,
+                metadataTitle: navigator.mediaSession && navigator.mediaSession.metadata
+                    ? navigator.mediaSession.metadata.title : null,
+            };
+        }"""
+        )
+        check("mediaSession 'play' handler actually starts playback",
+              ms_effect["bridgePaused"] is False and ms_effect["playbackState"] == "playing",
+              json.dumps(ms_effect))
 
         ms_pos = page.evaluate(
             """() => ({
