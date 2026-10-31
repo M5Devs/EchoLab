@@ -1,10 +1,15 @@
 /**
- * Client helper for the Cloudflare Worker CORS audio proxy.
+ * Client helper for the CORS audio proxy.
  *
  * Browsers cannot fetch most third-party audio hosts (SoundCloud CDNs, label
- * CDNs) directly because they omit `Access-Control-Allow-Origin`. The worker in
- * `cloudflare-worker/` relays the stream, mirrors the `Range` header so seeking
- * keeps working, and adds the CORS headers the browser requires.
+ * CDNs) directly because they omit `Access-Control-Allow-Origin`. The proxy
+ * relays the stream, mirrors the `Range` header so seeking keeps working, and
+ * adds the CORS headers the browser requires.
+ *
+ * The proxy is the Cloudflare Worker in `cloudflare-worker/`, the Vercel
+ * Serverless Function in `api/audio-proxy.ts`, or the Vite dev middleware in
+ * `tools/devAudioProxy.ts` — all three run the same core in
+ * `cloudflare-worker/src/proxy.js`.
  *
  * Configure the endpoint with `VITE_AUDIO_PROXY_URL`; when unset the app falls
  * back to the same-origin `/api/audio-proxy` route.
@@ -14,8 +19,12 @@ import { HTML_PAGE_MESSAGE, PLAYLIST_MESSAGE } from './audioFormat';
 
 const DEFAULT_PROXY_PATH = '/api/audio-proxy';
 
+/** Guard against a proxy that keeps advertising more bytes than it sends. */
+const MAX_ASSEMBLED_BYTES = 256 * 1024 * 1024;
+const MAX_CHUNK_REQUESTS = 64;
+
 export function getAudioProxyEndpoint(): string {
-  const configured = (import.meta.env.VITE_AUDIO_PROXY_URL as string | undefined)?.trim();
+  const configured = (import.meta.env?.VITE_AUDIO_PROXY_URL as string | undefined)?.trim();
   if (configured) return configured.replace(/\/$/, '');
   return DEFAULT_PROXY_PATH;
 }
@@ -83,6 +92,75 @@ async function describeHttpFailure(response: Response): Promise<string> {
 }
 
 /**
+ * Follow a chunked (`206` + `Content-Range`) response to completion.
+ *
+ * A Vercel Function cannot return a body over 4.5 MB, and a resolved SoundCloud
+ * track is routinely larger, so the function serves it in ranges that stay under
+ * the cap. Each chunk is fetched with an explicit `Range` so this works even if
+ * the platform ignores `Accept-Ranges` for the follow-up requests.
+ *
+ * Returns the original response untouched when it is not a partial one, so the
+ * Cloudflare Worker and the dev middleware — which serve the whole payload in a
+ * single 200 — keep streaming without buffering.
+ *
+ * A partial response is also passed through when the *caller* asked for a range.
+ * Only a 206 the proxy produced on its own (to stay under a platform body cap)
+ * should be followed to completion; reassembling a caller's `Range: bytes=0-99`
+ * would turn a deliberate 100-byte read into a full-file download.
+ */
+export async function assembleChunkedResponse(
+  response: Response,
+  url: string,
+  init?: RequestInit,
+  fetchImpl: typeof fetch = fetch
+): Promise<Response> {
+  if (new Headers(init?.headers).has('Range')) return response;
+
+  const contentRange = response.headers.get('content-range');
+  if (response.status !== 206 || !contentRange) return response;
+
+  const match = /bytes\s+(\d+)-(\d+)\/(\d+)/i.exec(contentRange);
+  if (!match) return response;
+
+  const total = Number(match[3]);
+  if (!Number.isFinite(total) || total <= 0 || total > MAX_ASSEMBLED_BYTES) return response;
+
+  const chunks: Uint8Array[] = [new Uint8Array(await response.arrayBuffer())];
+  let received = chunks[0].byteLength;
+
+  // Resume from where the last chunk ended rather than trusting its advertised
+  // end, so a short read cannot silently leave a hole in the audio.
+  let next = Number(match[1]) + chunks[0].byteLength;
+  const endpoint = getProxiedAudioUrl(url);
+
+  for (let request = 0; received < total && request < MAX_CHUNK_REQUESTS; request++) {
+    const headers = new Headers(init?.headers);
+    headers.set('Range', `bytes=${next}-${total - 1}`);
+
+    const part = await fetchImpl(endpoint, { ...init, headers });
+    if (!part.ok || part.status !== 206) break;
+
+    const bytes = new Uint8Array(await part.arrayBuffer());
+    if (!bytes.byteLength) break;
+    chunks.push(bytes);
+    received += bytes.byteLength;
+    next += bytes.byteLength;
+  }
+
+  const merged = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  const headers = new Headers(response.headers);
+  headers.set('Content-Length', String(merged.byteLength));
+  headers.delete('Content-Range');
+  return new Response(merged, { status: 200, headers });
+}
+
+/**
  * Fetch an audio resource, first directly (cheap, no proxy hop) and then through
  * the proxy. Throws an {@link AudioProxyError} with a user-facing message.
  */
@@ -113,7 +191,7 @@ export async function fetchAudioWithProxy(
     if (!proxied.ok) {
       throw new AudioProxyError(await describeHttpFailure(proxied), proxied.status);
     }
-    return proxied;
+    return await assembleChunkedResponse(proxied, url, init, fetchImpl);
   } catch (err) {
     if (err instanceof AudioProxyError) throw err;
     throw new AudioProxyError(describeFailure());

@@ -123,7 +123,29 @@ When prompted, set **Environment Variables** to match your `.env` file.
 6. Add all `VITE_FIREBASE_*` variables under **Environment Variables**
 7. Click **Deploy** ✅
 
-> The included `vercel.json` handles SPA client-side routing automatically.
+> The included `vercel.json` handles SPA client-side routing automatically. Its
+> rewrite deliberately excludes `/api/*` so the serverless functions under
+> `api/` keep their routes instead of being rewritten to `index.html`.
+
+### The `/api/audio-proxy` function
+
+`api/audio-proxy.ts` is a Vercel Serverless Function that serves the same-origin
+CORS audio proxy, so remote streams work on production without deploying the
+Cloudflare Worker. It shares its request handling with the worker and the local
+dev middleware (`cloudflare-worker/src/proxy.js`).
+
+Two platform details are worth knowing:
+
+- **The SPA rewrite must not swallow `/api/*`.** A catch-all rewrite sends
+  `/api/audio-proxy` to `index.html`, which is exactly the 404 this function
+  fixes. The rewrite in `vercel.json` excludes the `api/` prefix.
+- **Vercel caps a function's response body at 4.5 MB**, and a resolved
+  SoundCloud track is routinely larger (a 4-minute track is ~5 MB). The function
+  therefore serves a resolved track in 4 MB ranges and the client stitches them
+  back together (`assembleChunkedResponse` in `src/utils/audioProxy.ts`).
+
+Set `VITE_AUDIO_PROXY_URL` only if you would rather use the Cloudflare Worker;
+leave it unset to use this function.
 
 ---
 
