@@ -16,10 +16,11 @@
     "noUnusedParameters": false,
     "noFallthroughCasesInSwitch": true,
     "types": ["node", "vite/client", "vite-plugin-pwa/client"],
+    "allowJs": true,
     "paths": {
       "@/*": ["./src/*"]
     }
   },
-  "include": ["src/**/*"],
+  "include": ["src/**/*", "api/**/*", "tools/**/*"],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }

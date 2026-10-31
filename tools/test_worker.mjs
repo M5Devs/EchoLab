@@ -207,6 +207,13 @@ const noHydrationBody = await noHydration.json();
 check('a page without hydration returns a friendly JSON error',
   noHydration.status === 502 && typeof noHydrationBody.error === 'string' &&
   /resolve/i.test(noHydrationBody.error), JSON.stringify(noHydrationBody));
+// The message must be the resolver's own wording. A bare `/resolve/i` also
+// matches "SoundCloud resolve failed: HttpError is not defined", which is how a
+// missing import in the resolver once shipped unnoticed.
+check('the error is the resolver\'s own message, not a swallowed internal error',
+  noHydrationBody.error === 'Could not resolve this SoundCloud track. It may be private, removed or region-restricted.' &&
+  !/is not defined|undefined|\[object/i.test(noHydrationBody.error),
+  JSON.stringify(noHydrationBody));
 
 globalThis.fetch = realFetch;
 

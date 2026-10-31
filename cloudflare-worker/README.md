@@ -66,11 +66,11 @@ VITE_AUDIO_PROXY_URL=https://echolab-audio-proxy.<subdomain>.workers.dev
 ```
 
 If `VITE_AUDIO_PROXY_URL` is unset the client falls back to the same-origin
-`/api/audio-proxy` route. Vite dev and preview servers serve it from
-`tools/devAudioProxy.ts`, which imports the **same** resolver module
-(`cloudflare-worker/src/soundcloud.js`) so local behaviour matches production;
-for production add a rewrite to the worker (Vercel `vercel.json`, nginx
-`proxy_pass`, Cloudflare route, …).
+`/api/audio-proxy` route. That route is served in development by
+`tools/devAudioProxy.ts` and in production by the Vercel Serverless Function in
+`api/audio-proxy.ts`. All three targets — this worker, the Vercel function and
+the dev middleware — delegate to the same request handling in
+`cloudflare-worker/src/proxy.js`, so they cannot drift.
 
 ## Host allow-list
 
@@ -81,13 +81,17 @@ audio extension, so it cannot be used as an open web relay.
 ## Verify
 
 ```bash
-node tools/test_worker.mjs        # worker + resolver, no network or browser needed
+npm run test:worker               # worker + resolver, no network or browser needed
+npm run test:vercel               # Vercel function adapter + chunked transfer
+npm run test:client               # client chunk reassembly
 python3 tools/verify_echolab.py   # full browser suite (needs the dev server)
 ```
 
 `tools/test_worker.mjs` drives the real worker handler against a stubbed fetch
 serving a SoundCloud-shaped tree (page → transcoding → playlist → fMP4
 fragments), asserting the stitched bytes, the CORS contract and the Range relay.
+`tools/test_vercel_api.mjs` does the same for the Vercel handler, including the
+chunked transfer a track larger than Vercel's 4.5 MB body cap requires.
 `tools/verify_echolab.py` additionally resolves the real acceptance-criteria URL
 in the browser and decodes it.
 

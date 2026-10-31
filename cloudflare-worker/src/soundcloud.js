@@ -20,6 +20,8 @@
  *      a single fragmented-MP4 stream.
  */
 
+import { HttpError } from './http.js';
+
 const SC_HOST_RE = /(^|\.)soundcloud\.com$/i;
 const MAX_PLAYLIST_BYTES = 2 * 1024 * 1024;
 const MAX_TRACK_BYTES = 128 * 1024 * 1024;

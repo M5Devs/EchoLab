@@ -360,6 +360,87 @@ def run(upstream):
               and proxy_test["blobUrl"] == "blob:http://localhost/x"
               and proxy_test["sameOrigin"].endswith("/a.mp3"))
 
+        # ── 6b. The /api/audio-proxy endpoint actually exists ─────────────────
+        # On Vercel this route is what 404s when the SPA rewrite swallows it, so
+        # assert it answers rather than returning the index.html document.
+        endpoint_test = page.evaluate(
+            """async () => {
+            const out = {};
+            const pre = await fetch('/api/audio-proxy', { method: 'OPTIONS' });
+            out.preflight = pre.status;
+            out.allowOrigin = pre.headers.get('Access-Control-Allow-Origin');
+            out.allowMethods = pre.headers.get('Access-Control-Allow-Methods');
+            out.expose = pre.headers.get('Access-Control-Expose-Headers');
+
+            const bad = await fetch('/api/audio-proxy');
+            out.missingStatus = bad.status;
+            out.missingType = bad.headers.get('Content-Type') || '';
+            try { out.missingError = (await bad.json()).error; } catch { out.missingError = null; }
+            return out;
+        }"""
+        )
+        check("OPTIONS on /api/audio-proxy is a 204 with the CORS contract",
+              endpoint_test["preflight"] == 204
+              and endpoint_test["allowOrigin"] == "*"
+              and endpoint_test["allowMethods"] == "GET, HEAD, OPTIONS"
+              and endpoint_test["expose"] == "Content-Length, Content-Range, Accept-Ranges",
+              json.dumps(endpoint_test))
+        check("a missing ?url= returns JSON, not the SPA index.html",
+              endpoint_test["missingStatus"] == 400
+              and "json" in endpoint_test["missingType"].lower()
+              and endpoint_test["missingError"],
+              f"{endpoint_test['missingStatus']} {endpoint_test['missingType']}")
+
+        # ── 6c. Chunked (ranged) responses reassemble exactly ─────────────────
+        # A Vercel function cannot return a body over 4.5 MB, so it serves a
+        # resolved track in ranges and the client stitches them. Prove the client
+        # half round-trips, including the short-final-chunk case.
+        chunk_test = page.evaluate(
+            """async () => {
+            const { assembleChunkedResponse } = await import('/src/utils/audioProxy.ts');
+            const total = 6 * 1024 * 1024;
+            const original = new Uint8Array(total);
+            for (let i = 0; i < total; i++) original[i] = (i * 31 + 7) & 0xff;
+            const chunk = 4 * 1024 * 1024;
+            const requests = [];
+
+            const impl = async (input, init) => {
+                const range = new Headers(init && init.headers).get('Range');
+                requests.push(range);
+                const start = range ? Number(/bytes=(\\d+)-/.exec(range)[1]) : 0;
+                const end = Math.min(start + chunk, total) - 1;
+                return new Response(original.subarray(start, end + 1), {
+                    status: 206,
+                    headers: {
+                        'Content-Type': 'audio/mp4',
+                        'Content-Range': `bytes ${start}-${end}/${total}`,
+                        'Accept-Ranges': 'bytes',
+                    },
+                });
+            };
+
+            const first = await impl('https://soundcloud.com/a/b');
+            const assembled = await assembleChunkedResponse(first, 'https://soundcloud.com/a/b', undefined, impl);
+            const bytes = new Uint8Array(await assembled.arrayBuffer());
+            return {
+                status: assembled.status,
+                length: bytes.length,
+                total,
+                identical: bytes.every((b, i) => b === original[i]),
+                contentRangeDropped: assembled.headers.get('Content-Range') === null,
+                followUpsRanged: requests.slice(1).every(r => typeof r === 'string'),
+            };
+        }"""
+        )
+        check("chunked 206 responses reassemble to the exact original bytes",
+              chunk_test["status"] == 200
+              and chunk_test["length"] == chunk_test["total"]
+              and chunk_test["identical"]
+              and chunk_test["contentRangeDropped"],
+              json.dumps(chunk_test))
+        check("chunk follow-ups carry an explicit Range",
+              chunk_test["followUpsRanged"], json.dumps(chunk_test))
+
         # ── 7. MediaSession handlers registered without exceptions ────────────
         ms_test = page.evaluate(
             """async () => {
