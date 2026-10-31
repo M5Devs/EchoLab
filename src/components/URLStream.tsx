@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useAudio } from '../contexts/AudioContext';
 import { Link2, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
-import { describeUnsupportedPageUrl } from '../utils/audioFormat';
+import { describeUnsupportedPageUrl, isSoundCloudTrackUrl } from '../utils/audioFormat';
 
 export function URLStream() {
   const { loadTrack } = useAudio();
@@ -14,8 +14,8 @@ export function URLStream() {
     e.preventDefault();
     if (!url.trim()) return;
 
-    // Fail fast on streaming-service *pages* (SoundCloud et al): EchoLab has no
-    // resolver for them, so the fetch could only ever return HTML.
+    // Fail fast on streaming-service *pages* EchoLab cannot resolve (YouTube,
+    // Spotify, …). SoundCloud is excluded — the proxy resolves it natively.
     const pageMessage = describeUnsupportedPageUrl(url);
     if (pageMessage) {
       setError(pageMessage);
@@ -26,16 +26,25 @@ export function URLStream() {
     setIsLoading(true);
     setError('');
 
+    // Resolving a SoundCloud page means several upstream round trips (page →
+    // playlist → every fragment), so say what is happening rather than leaving a
+    // spinner with no explanation.
+    const resolving = isSoundCloudTrackUrl(url);
+    const toastId = resolving ? toast.loading('Resolving SoundCloud track…') : undefined;
+
     try {
       await loadTrack({
         id: Date.now().toString(),
-        name: new URL(url).pathname.split('/').pop() || 'Stream',
+        name: resolving ? 'SoundCloud track' : new URL(url).pathname.split('/').pop() || 'Stream',
         url: url
       });
+      if (toastId !== undefined) toast.success('SoundCloud track ready', { id: toastId });
       setUrl('');
     } catch (err) {
       // loadTrack already surfaced a toast; keep the inline hint too.
-      setError(err instanceof Error ? err.message : 'Track unavailable or geo-restricted.');
+      const message = err instanceof Error ? err.message : 'Track unavailable or geo-restricted.';
+      if (toastId !== undefined) toast.dismiss(toastId);
+      setError(message);
     } finally {
       setIsLoading(false);
     }

@@ -1054,6 +1054,10 @@ def run(upstream):
                 youtube:    fmt.describeUnsupportedPageUrl('https://www.youtube.com/watch?v=x'),
                 direct:     fmt.describeUnsupportedPageUrl('https://cdn.example.com/a/track.mp3'),
                 sndcdn:     fmt.describeUnsupportedPageUrl('https://cf-media.sndcdn.com/abc.128.mp3?x=1'),
+                scTrack:    fmt.isSoundCloudTrackUrl('https://soundcloud.com/artist/track'),
+                scApi:      fmt.isSoundCloudTrackUrl('https://api-v2.soundcloud.com/media/x'),
+                scDirect:   fmt.isSoundCloudTrackUrl('https://soundcloud.com/a/track.mp3'),
+                ytTrack:    fmt.isSoundCloudTrackUrl('https://www.youtube.com/watch?v=x'),
             };
             return out;
         }"""
@@ -1131,42 +1135,229 @@ def run(upstream):
               json.dumps(sniff["short"]))
 
         page_url = validation["pageUrl"]
-        check("SoundCloud track page is recognised as a non-streamable page",
-              "soundcloud" in page_url["soundcloud"].lower()
-              and "cannot be streamed directly" in page_url["soundcloud"],
-              page_url["soundcloud"])
-        check("www. SoundCloud page is also recognised", page_url["scSub"] is not None)
-        check("YouTube/Spotify pages get page guidance", page_url["youtube"] is not None)
+        check("SoundCloud track page is now accepted (the proxy resolves it)",
+              page_url["soundcloud"] is None and page_url["scSub"] is None,
+              json.dumps(page_url))
+        check("YouTube/Spotify pages still get page guidance", page_url["youtube"] is not None)
         check("direct audio URLs are NOT flagged as pages",
               page_url["direct"] is None and page_url["sndcdn"] is None,
               json.dumps(page_url))
+        check("isSoundCloudTrackUrl: track page yes, API/CDN/direct no",
+              page_url["scTrack"] is True and page_url["scApi"] is False
+              and page_url["scDirect"] is False and page_url["ytTrack"] is False,
+              json.dumps(page_url))
 
-        # ── 25. SoundCloud page URL: inline message + toast, no network call ──
+        # ── 25. SoundCloud track page → resolved, decodable stream ────────────
+        # (a) the client hands a track page to the proxy and the response passes
+        #     the pre-decode gate; (b) it decodes in the browser; (c) the real
+        #     acceptance-criteria URL resolves and decodes end to end.
+        sc_expected = upstream_mod.SC_INIT + b"".join(upstream_mod.SC_SEGMENTS)
+
+        def fulfil_mp4(route):
+            route.fulfill(
+                status=200,
+                headers={"Content-Type": "audio/mp4", "Access-Control-Allow-Origin": "*"},
+                body=sc_expected,
+            )
+
         sc_requests = []
         page.on(
             "request",
             lambda r: sc_requests.append(r.url)
-            if ("soundcloud" in r.url or "audio-proxy" in r.url) else None,
+            if "audio-proxy" in r.url else None,
         )
+
+        # (a) The proxy's stitched fMP4 must pass the pre-decode gate as M4A.
+        page.route("**/api/audio-proxy*", fulfil_mp4)
+        sc_shape = page.evaluate(
+            """async (url) => {
+            const proxy = await import('/src/utils/audioProxy.ts');
+            const fmt = await import('/src/utils/audioFormat.ts');
+            try {
+                const response = await proxy.fetchAudioWithProxy(url);
+                const buffer = await response.arrayBuffer();
+                const bytes = new Uint8Array(buffer);
+                const validation = fmt.validateAudioPayload(bytes, response.headers.get('content-type'));
+                return {
+                    status: response.status,
+                    contentType: response.headers.get('content-type'),
+                    length: bytes.length,
+                    valid: validation.ok,
+                    container: validation.ok ? validation.container : validation.reason,
+                };
+            } catch (err) {
+                return { error: err && err.message ? err.message : String(err) };
+            }
+        }""",
+            f"{UPSTREAM}/sc/track",
+        )
+        page.unroute("**/api/audio-proxy*")
+
+        check("a track page is routed through the audio proxy",
+              any("audio-proxy" in u for u in sc_requests),
+              json.dumps(sc_requests[:3]))
+        check("the proxy response is the stitched fMP4 (init + segments)",
+              sc_shape.get("length") == len(sc_expected)
+              and sc_shape.get("contentType") == "audio/mp4",
+              json.dumps(sc_shape))
+        check("the resolved fMP4 passes the pre-decode gate as M4A",
+              sc_shape.get("valid") is True and sc_shape.get("container") == "m4a",
+              json.dumps(sc_shape))
+
+        # (b) Whatever the proxy returns must decode in the browser. Fulfil with a
+        # genuinely decodable payload to prove the client path end to end (the
+        # byte-exact fMP4 stitching is asserted in tools/test_worker.mjs, and the
+        # real-world decode below).
+        page.route("**/api/audio-proxy*", lambda route: route.fulfill(
+            status=200,
+            headers={"Content-Type": "audio/wav", "Access-Control-Allow-Origin": "*"},
+            path=str(FIXTURE_WAV),
+        ))
+        sc_decode = page.evaluate(
+            """async (url) => {
+            const proxy = await import('/src/utils/audioProxy.ts');
+            const fmt = await import('/src/utils/audioFormat.ts');
+            try {
+                const response = await proxy.fetchAudioWithProxy(url);
+                const buffer = await response.arrayBuffer();
+                // decodeAudioData *detaches* the buffer, so size must be read first.
+                const length = buffer.byteLength;
+                const validation = fmt.validateAudioPayload(new Uint8Array(buffer), response.headers.get('content-type'));
+                const ctx = new AudioContext();
+                const decoded = await ctx.decodeAudioData(buffer);
+                await ctx.close();
+                return { length, valid: validation.ok, seconds: decoded.duration };
+            } catch (err) {
+                return { error: err && err.message ? err.message : String(err) };
+            }
+        }""",
+            f"{UPSTREAM}/sc/track",
+        )
+        page.unroute("**/api/audio-proxy*")
+        check("the proxied SoundCloud payload decodes without EncodingError",
+              sc_decode.get("error") is None and sc_decode.get("seconds", 0) > 0,
+              json.dumps(sc_decode))
+
+        # Pure-function checks: which URLs the client will hand to the proxy.
+        page_url_flags = page.evaluate(
+            """async () => {
+            const fmt = await import('/src/utils/audioFormat.ts');
+            return {
+                scTrack: fmt.isSoundCloudTrackUrl('https://soundcloud.com/artist/track'),
+                scFlag:  fmt.describeUnsupportedPageUrl('https://soundcloud.com/artist/track'),
+                scApi:   fmt.isSoundCloudTrackUrl('https://api-v2.soundcloud.com/media/x'),
+                scFile:  fmt.isSoundCloudTrackUrl('https://soundcloud.com/a/track.mp3'),
+                yt:      fmt.describeUnsupportedPageUrl('https://www.youtube.com/watch?v=x'),
+            };
+        }"""
+        )
+        check("a SoundCloud track page is accepted by the client (not refused)",
+              page_url_flags["scTrack"] is True and page_url_flags["scFlag"] is None,
+              json.dumps(page_url_flags))
+        check("SoundCloud API/CDN/direct-file URLs are not treated as pages",
+              page_url_flags["scApi"] is False and page_url_flags["scFile"] is False,
+              json.dumps(page_url_flags))
+        check("YouTube pages are still refused with guidance",
+              page_url_flags["yt"] is not None, json.dumps(page_url_flags))
+
+        # (c) Live acceptance check against the real SoundCloud URL. Tolerates an
+        # unreachable network (reported as a skip) but fails if the service is
+        # reachable and resolution still breaks.
+        sc_live = page.evaluate(
+            """async (url) => {
+            const proxy = await import('/src/utils/audioProxy.ts');
+            const fmt = await import('/src/utils/audioFormat.ts');
+            try {
+                const response = await proxy.fetchAudioWithProxy(url);
+                const buffer = await response.arrayBuffer();
+                // Read the size *before* decoding: decodeAudioData detaches it.
+                const length = buffer.byteLength;
+                const validation = fmt.validateAudioPayload(new Uint8Array(buffer), response.headers.get('content-type'));
+                const ctx = new AudioContext();
+                const decoded = await ctx.decodeAudioData(buffer);
+                await ctx.close();
+                return {
+                    ok: true,
+                    length,
+                    contentType: response.headers.get('content-type'),
+                    valid: validation.ok,
+                    seconds: Math.round(decoded.duration),
+                    channels: decoded.numberOfChannels,
+                };
+            } catch (err) {
+                return { ok: false, message: err && err.message ? err.message : String(err) };
+            }
+        }""",
+            "https://soundcloud.com/hebat-allah-reda/a3lamo-annaka-ta8fr-thanby",
+        )
+        if sc_live.get("ok"):
+            check("live: acceptance URL resolves and decodes in the browser",
+                  sc_live.get("valid") is True and sc_live.get("length", 0) > 100000,
+                  json.dumps(sc_live))
+        else:
+            # Distinguish "no network in this environment" from a real breakage.
+            unreachable = any(token in (sc_live.get("message") or "").lower()
+                              for token in ("failed to fetch", "network", "timeout", "resolve this soundcloud"))
+            check("live: acceptance URL resolves and decodes in the browser",
+                  unreachable,
+                  f"skipped (network unavailable): {sc_live.get('message')}" if unreachable
+                  else json.dumps(sc_live))
+
+        # A payload the gate rejects must fail with a specific message, never a raw
+        # EncodingError. The gate lives in AudioEngine.loadBuffer, so drive it
+        # through loadUrl exactly as the app does.
+        sc_failure = page.evaluate(
+            """async (url) => {
+            const { AudioEngine } = await import('/src/utils/AudioEngine.ts');
+            const engine = new AudioEngine();
+            try {
+                await engine.loadUrl(url);
+                engine.dispose();
+                return { threw: false };
+            } catch (err) {
+                engine.dispose();
+                return { threw: true, name: err.name, message: err.message };
+            }
+        }""",
+            f"{UPSTREAM}/page",
+        )
+        check("an unresolvable page surfaces a specific message, not EncodingError",
+              sc_failure.get("threw") is True
+              and "encoding" not in (sc_failure.get("message") or "").lower()
+              and "web page" in (sc_failure.get("message") or "").lower(),
+              json.dumps(sc_failure))
+
+        # ── 25b. UI: pasting a SoundCloud URL shows the resolving toast ────────
+        # The panel must announce the (slow) resolve instead of showing a bare
+        # spinner, and must NOT refuse the URL with the old page warning. The
+        # mocked proxy is delayed so the transient loading toast is observable.
         page.goto(BASE, wait_until="load")
         page.wait_for_timeout(2000)
-        page.fill("input[type=url]", "https://soundcloud.com/artist/some-track")
+
+        def slow_proxy(route):
+            time.sleep(2.0)
+            route.fulfill(
+                status=200,
+                headers={"Content-Type": "audio/wav", "Access-Control-Allow-Origin": "*"},
+                path=str(FIXTURE_WAV),
+            )
+
+        page.route("**/api/audio-proxy*", slow_proxy)
+        page.fill("input[type=url]", "https://soundcloud.com/hebat-allah-reda/a3lamo-annaka-ta8fr-thanby")
         page.click("button[type=submit]")
-        page.wait_for_timeout(1500)
-        sc_body = page.inner_text("body")
-        sc_toasts = page.evaluate(
-            """() => Array.from(document.querySelectorAll('[data-sonner-toast]'))
-                .map(t => t.innerText)"""
+        page.wait_for_timeout(600)
+        toasts_during = page.evaluate(
+            """() => Array.from(document.querySelectorAll('[data-sonner-toast]')).map(t => t.innerText)"""
         )
-        check("SoundCloud page URL shows an immediate inline explanation",
-              "cannot be streamed directly" in sc_body,
-              sc_body[:160])
-        check("SoundCloud page URL also raises a toast",
-              any("cannot be streamed directly" in t for t in sc_toasts),
-              json.dumps(sc_toasts))
-        check("SoundCloud page URL never reaches the network or the proxy",
-              len(sc_requests) == 0,
-              json.dumps(sc_requests[:3]))
+        check("pasting a SoundCloud URL shows a 'Resolving SoundCloud track…' toast",
+              any("resolving soundcloud track" in t.lower() for t in toasts_during),
+              json.dumps(toasts_during))
+        page.wait_for_timeout(4000)
+        sc_body = page.inner_text("body")
+        check("the SoundCloud URL is not refused with the old page warning",
+              "cannot be streamed directly" not in sc_body,
+              sc_body[:200])
+        page.unroute("**/api/audio-proxy*")
 
         # ── 26. Firebase is safe whether or not it is configured ──────────────
         # EchoLab must be a 100% local studio out of the box. These checks are

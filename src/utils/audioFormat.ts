@@ -188,8 +188,14 @@ export const SOUNDCLOUD_PAGE_MESSAGE =
 export const STREAMING_PAGE_MESSAGE =
   'That link is a streaming web page, not an audio file. Please provide a direct audio stream URL or MP3 link.';
 
+/**
+ * Hosts the audio proxy knows how to resolve into a playable stream. A page URL
+ * on one of these is accepted by the client and handed to the proxy, which does
+ * the resolving — see `cloudflare-worker/src/soundcloud.js`.
+ */
+const RESOLVABLE_PAGE_HOSTS: readonly RegExp[] = [/(^|\.)soundcloud\.com$/i];
+
 const PAGE_HOSTS: ReadonlyArray<readonly [RegExp, string]> = [
-  [/(^|\.)soundcloud\.com$/i, SOUNDCLOUD_PAGE_MESSAGE],
   [/(^|\.)(youtube\.com|youtu\.be|music\.youtube\.com)$/i, STREAMING_PAGE_MESSAGE],
   [/(^|\.)(spotify\.com|open\.spotify\.com)$/i, STREAMING_PAGE_MESSAGE],
   [/(^|\.)(bandcamp\.com)$/i, STREAMING_PAGE_MESSAGE],
@@ -199,12 +205,10 @@ const PAGE_HOSTS: ReadonlyArray<readonly [RegExp, string]> = [
 const DIRECT_AUDIO_EXTENSIONS = /\.(mp3|wav|ogg|oga|opus|flac|m4a|aac|weba|webm|aiff?|mp4)(\?|#|$)/i;
 
 /**
- * Detect a link that points at a *page* (SoundCloud, YouTube, …) rather than a
- * direct audio file, and return the guidance to show. Returns `null` when the URL
- * looks like a plausible direct audio resource.
- *
- * EchoLab has no streaming-service resolver, so a page URL can only ever resolve
- * to HTML — better to say so up front than to fail later with a decode error.
+ * Detect a link that points at a *page* (YouTube, Spotify, …) rather than a
+ * direct audio file, and return the guidance to show. Returns `null` when the
+ * URL looks like a plausible direct audio resource — including a SoundCloud
+ * track page, which the audio proxy resolves natively.
  */
 export function describeUnsupportedPageUrl(rawUrl: string): string | null {
   let parsed: URL;
@@ -215,8 +219,26 @@ export function describeUnsupportedPageUrl(rawUrl: string): string | null {
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
   if (DIRECT_AUDIO_EXTENSIONS.test(parsed.pathname)) return null;
+  if (RESOLVABLE_PAGE_HOSTS.some(pattern => pattern.test(parsed.hostname))) return null;
   for (const [pattern, message] of PAGE_HOSTS) {
     if (pattern.test(parsed.hostname)) return message;
   }
   return null;
+}
+
+/**
+ * True when `rawUrl` is a SoundCloud track page the proxy can resolve. Used by
+ * the UI to show a "resolving…" status instead of a decode failure.
+ */
+export function isSoundCloudTrackUrl(rawUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  if (!/(^|\.)soundcloud\.com$/i.test(parsed.hostname)) return false;
+  if (/^(api|api-v2|cf-media|playback|media-streaming)\./.test(parsed.hostname)) return false;
+  return !DIRECT_AUDIO_EXTENSIONS.test(parsed.pathname);
 }
