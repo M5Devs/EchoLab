@@ -8,6 +8,8 @@
  *  - GET / HEAD / OPTIONS, with full CORS preflight support
  *  - Transparent `Range` pass-through, so seeking/scrubbing keeps working
  *  - `Accept-Ranges`, `Content-Length`, `Content-Range` exposure for the client
+ *  - Native SoundCloud resolver: a track *page* URL is resolved to its audio and
+ *    returned as one progressive stream (see `soundcloud.js`)
  *
  * Deploy
  *   cd cloudflare-worker
@@ -18,13 +20,8 @@
  *   npx wrangler dev
  */
 
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-  'Access-Control-Allow-Headers': '*',
-  'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
-  'Access-Control-Max-Age': '86400',
-};
+import { withCors, jsonError, HttpError } from './http.js';
+import { isSoundCloudPageUrl, resolveSoundCloudTrack } from './soundcloud.js';
 
 // Only relay plausible audio/media URLs so the worker cannot be abused as an
 // open web relay.
@@ -49,17 +46,66 @@ function isAllowedTarget(target) {
   return hostOk || extOk;
 }
 
-function withCors(headers) {
-  const merged = new Headers(headers);
-  for (const [key, value] of Object.entries(CORS_HEADERS)) merged.set(key, value);
-  return merged;
+const RELAYED_HEADERS = [
+  'Content-Type',
+  'Content-Length',
+  'Content-Range',
+  'Accept-Ranges',
+  'Last-Modified',
+  'ETag',
+  'Cache-Control',
+];
+
+function passthroughHeaders(upstream) {
+  const headers = new Headers();
+  for (const name of RELAYED_HEADERS) {
+    const value = upstream.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  if (!headers.has('Accept-Ranges')) headers.set('Accept-Ranges', 'bytes');
+  if (!headers.has('Content-Type')) headers.set('Content-Type', 'audio/mpeg');
+  return headers;
 }
 
-function errorResponse(status, message) {
-  return new Response(JSON.stringify({ error: message }), {
-    status,
-    headers: withCors({ 'Content-Type': 'application/json' }),
+/** Forward only the headers that matter for streaming; never leak cookies. */
+function upstreamRequestHeaders(request) {
+  const headers = new Headers();
+  const range = request.headers.get('Range');
+  if (range) headers.set('Range', range);
+  const accept = request.headers.get('Accept');
+  if (accept) headers.set('Accept', accept);
+  headers.set('User-Agent', 'EchoLab-AudioProxy/1.0');
+  return headers;
+}
+
+async function relay(request, target) {
+  const upstream = await fetch(target.toString(), {
+    method: request.method,
+    headers: upstreamRequestHeaders(request),
+    redirect: 'follow',
   });
+  return new Response(request.method === 'HEAD' ? null : upstream.body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: withCors(passthroughHeaders(upstream)),
+  });
+}
+
+/**
+ * Resolve a SoundCloud track page and return the whole audio as one buffer.
+ *
+ * Range is deliberately not honoured: the response is a freshly stitched file
+ * with no upstream byte range to forward, so advertising `Accept-Ranges: bytes`
+ * would be a lie and seeking would break.
+ */
+async function serveSoundCloudTrack(request, target) {
+  const { bytes, contentType } = await resolveSoundCloudTrack(target.toString());
+  const headers = withCors({
+    'Content-Type': contentType,
+    'Content-Length': String(bytes.byteLength),
+    'Cache-Control': 'no-store',
+  });
+  return new Response(request.method === 'HEAD' ? null : bytes, { status: 200, headers });
 }
 
 export default {
@@ -69,69 +115,44 @@ export default {
     }
 
     if (request.method !== 'GET' && request.method !== 'HEAD') {
-      return errorResponse(405, 'Method not allowed');
+      return jsonError(405, 'Method not allowed');
     }
 
     const requestUrl = new URL(request.url);
     const rawTarget = requestUrl.searchParams.get('url');
     if (!rawTarget) {
-      return errorResponse(400, 'Missing "url" query parameter');
+      return jsonError(400, 'Missing "url" query parameter');
     }
 
     let target;
     try {
       target = new URL(rawTarget);
     } catch {
-      return errorResponse(400, 'Invalid "url" query parameter');
+      return jsonError(400, 'Invalid "url" query parameter');
     }
 
     if (target.protocol !== 'https:' && target.protocol !== 'http:') {
-      return errorResponse(400, 'Only http(s) URLs are supported');
+      return jsonError(400, 'Only http(s) URLs are supported');
     }
 
     if (!isAllowedTarget(target)) {
-      return errorResponse(403, 'Host is not on the audio allow-list');
+      return jsonError(403, 'Host is not on the audio allow-list');
     }
 
-    // Forward only the headers that matter for streaming; never leak cookies.
-    const upstreamHeaders = new Headers();
-    const range = request.headers.get('Range');
-    if (range) upstreamHeaders.set('Range', range);
-    const accept = request.headers.get('Accept');
-    if (accept) upstreamHeaders.set('Accept', accept);
-    upstreamHeaders.set('User-Agent', 'EchoLab-AudioProxy/1.0');
+    // A SoundCloud track *page* is resolved to audio before relaying.
+    if (isSoundCloudPageUrl(target)) {
+      try {
+        return await serveSoundCloudTrack(request, target);
+      } catch (err) {
+        if (err instanceof HttpError) return jsonError(err.status, err.message);
+        return jsonError(502, `SoundCloud resolve failed: ${err.message}`);
+      }
+    }
 
-    let upstream;
     try {
-      upstream = await fetch(target.toString(), {
-        method: request.method,
-        headers: upstreamHeaders,
-        redirect: 'follow',
-      });
+      return await relay(request, target);
     } catch (err) {
-      return errorResponse(502, `Upstream fetch failed: ${err.message}`);
+      return jsonError(502, `Upstream fetch failed: ${err.message}`);
     }
-
-    const responseHeaders = new Headers();
-    for (const name of [
-      'Content-Type',
-      'Content-Length',
-      'Content-Range',
-      'Accept-Ranges',
-      'Last-Modified',
-      'ETag',
-      'Cache-Control',
-    ]) {
-      const value = upstream.headers.get(name);
-      if (value) responseHeaders.set(name, value);
-    }
-    if (!responseHeaders.has('Accept-Ranges')) responseHeaders.set('Accept-Ranges', 'bytes');
-    if (!responseHeaders.has('Content-Type')) responseHeaders.set('Content-Type', 'audio/mpeg');
-
-    return new Response(request.method === 'HEAD' ? null : upstream.body, {
-      status: upstream.status,
-      statusText: upstream.statusText,
-      headers: withCors(responseHeaders),
-    });
   },
 };

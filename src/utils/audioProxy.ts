@@ -62,13 +62,23 @@ function describeFailure(status?: number): string {
  *
  * An HTML body is reported as such even when the status also carries a meaning
  * (a Cloudflare/captcha interstitial is a 403 whose body is a web page), because
- * "you were served a web page" is the actionable diagnosis. Other statuses keep
- * their precise HTTP meaning — a 404 body is not more informative than "not found".
+ * "you were served a web page" is the actionable diagnosis. The proxy's own JSON
+ * errors carry a specific message — a SoundCloud resolve failure, for instance —
+ * which is more useful than any generic phrasing. Other statuses keep their
+ * precise HTTP meaning.
  */
-function describeHttpFailure(response: Response): string {
+async function describeHttpFailure(response: Response): Promise<string> {
   const contentType = response.headers.get('content-type') ?? '';
   if (/text\/html|application\/xhtml/i.test(contentType)) return HTML_PAGE_MESSAGE;
   if (/mpegurl/i.test(contentType)) return PLAYLIST_MESSAGE;
+  if (/application\/json/i.test(contentType)) {
+    try {
+      const body = await response.clone().json();
+      if (body && typeof body.error === 'string' && body.error) return body.error;
+    } catch {
+      // Not a JSON error envelope — fall through to the status wording.
+    }
+  }
   return describeFailure(response.status);
 }
 
@@ -86,7 +96,7 @@ export async function fetchAudioWithProxy(
   if (!isRemote) {
     const direct = await fetchImpl(url, init);
     if (!direct.ok) {
-      throw new AudioProxyError(describeHttpFailure(direct), direct.status);
+      throw new AudioProxyError(await describeHttpFailure(direct), direct.status);
     }
     return direct;
   }
@@ -101,7 +111,7 @@ export async function fetchAudioWithProxy(
   try {
     const proxied = await fetchImpl(getProxiedAudioUrl(url), init);
     if (!proxied.ok) {
-      throw new AudioProxyError(describeHttpFailure(proxied), proxied.status);
+      throw new AudioProxyError(await describeHttpFailure(proxied), proxied.status);
     }
     return proxied;
   } catch (err) {

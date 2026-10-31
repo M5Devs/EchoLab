@@ -1,4 +1,8 @@
 import type { Connect, Plugin } from 'vite';
+// The resolver lives with the worker so development and production resolve
+// SoundCloud through exactly the same code path — a second implementation here
+// would drift and only break in production.
+import { isSoundCloudPageUrl, resolveSoundCloudTrack, RESOLVE_FAILED_MESSAGE } from '../cloudflare-worker/src/soundcloud.js';
 
 /**
  * Dev/preview implementation of the CORS audio proxy.
@@ -7,7 +11,8 @@ import type { Connect, Plugin } from 'vite';
  * `VITE_AUDIO_PROXY_URL`. Without a local equivalent the client's default
  * `/api/audio-proxy` endpoint would 404 in development and every remote stream
  * would look "unavailable", so this middleware mirrors the worker's contract:
- * GET/HEAD/OPTIONS, CORS headers, and transparent `Range` pass-through.
+ * GET/HEAD/OPTIONS, CORS headers, transparent `Range` pass-through, and the
+ * SoundCloud track resolver.
  *
  * Unlike the deployed worker this does not restrict target hosts — it only ever
  * runs on a developer's machine and never accepts traffic from the internet.
@@ -58,6 +63,26 @@ export function audioProxyPlugin(): Plugin {
       return send(400, JSON.stringify({ error: 'Only http(s) URLs are supported' }), {
         'Content-Type': 'application/json',
       });
+    }
+
+    // Mirror the worker: resolve a SoundCloud track page to a single progressive
+    // stream before relaying. Range is not honoured here either — the payload is
+    // freshly stitched, so there is no upstream byte range to forward.
+    if (isSoundCloudPageUrl(target)) {
+      try {
+        const { bytes, contentType } = await resolveSoundCloudTrack(target.toString());
+        res.writeHead(200, {
+          ...cors,
+          'Content-Type': contentType,
+          'Content-Length': String(bytes.byteLength),
+          'Cache-Control': 'no-store',
+        });
+        return res.end(req.method === 'HEAD' ? undefined : Buffer.from(bytes));
+      } catch (err) {
+        const status = (err as { status?: number }).status ?? 502;
+        const message = (err as Error).message || RESOLVE_FAILED_MESSAGE;
+        return send(status, JSON.stringify({ error: message }), { 'Content-Type': 'application/json' });
+      }
     }
 
     const upstreamHeaders: Record<string, string> = { 'User-Agent': 'EchoLab-AudioProxy/1.0' };

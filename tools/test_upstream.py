@@ -13,14 +13,25 @@ A deliberately *foreign-origin* HTTP server (no CORS headers) that serves:
   /notfound.mp3         404
   /boom.mp3            500
 
-It exists so the "the URL returned a web page, not audio" path can be tested
-against a real network response rather than a mock. Python's built-in
-`http.server` is not used because it ignores the `Range` header, which the proxy
-checks depend on.
+And a SoundCloud-shaped tree so the resolver can be exercised without touching
+the real service:
+
+  /sc/track             a track page carrying `window.__sc_hydration`
+  /sc/media/hls.json    the transcoding endpoint, returning a playlist URL
+  /sc/playlist.m3u8     a fragmented-MP4 media playlist (init + segments)
+  /sc/init.mp4          the fMP4 init segment (ftyp + moov)
+  /sc/seg<N>.m4s        media fragments (moof + mdat)
+
+It exists so the "the URL returned a web page, not audio" path and the SoundCloud
+resolver can be tested against real network responses rather than mocks. Python's
+built-in `http.server` is not used because it ignores the `Range` header, which
+the proxy checks depend on.
 
 Usage:  python3 tools/test_upstream.py [port]   (default 8898)
 """
 
+import json
+import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -73,6 +84,63 @@ HLS_PLAYLIST = (
 
 JSON_BODY = b'{"error":"track is not available in your region"}'
 TEXT_BODY = b'Not Found - the requested track has been removed.'
+
+# ── SoundCloud-shaped fixtures ────────────────────────────────────────────────
+# A real fMP4 init segment starts with a box size then "ftyp"; the resolver only
+# concatenates bytes, so the payload just needs the right shape and order.
+SC_INIT = (0x18).to_bytes(4, 'big') + b'ftypiso5' + b'\x00\x00\x00\x00iso5' + b'\x00' * 8
+SC_SEGMENTS = [
+    (0x10).to_bytes(4, 'big') + b'moof' + b'\x00' * 8 + b'audio-one',
+    (0x10).to_bytes(4, 'big') + b'moof' + b'\x00' * 8 + b'audio-two',
+    (0x10).to_bytes(4, 'big') + b'moof' + b'\x00' * 8 + b'audio-three',
+]
+SC_CLIENT_ID = 'QhVEWrrJKvW4uSU5u5EoI0FTXYUGzy5k'
+
+SC_HYDRATION = [
+    {"hydratable": "apiClient", "data": {"id": SC_CLIENT_ID, "isExpiring": True}},
+    {
+        "hydratable": "sound",
+        "data": {
+            "id": 123456,
+            "kind": "track",
+            "title": "Test Track",
+            "streamable": True,
+            "policy": "MONETIZE",
+            "duration": 30000,
+            "user": {"username": "Test Artist"},
+            "track_authorization": "test-auth-token",
+            "media": {
+                "transcodings": [
+                    {
+                        "format": {"protocol": "hls", "mime_type": 'audio/mp4; codecs="mp4a.40.2"'},
+                        "preset": "aac_160k",
+                        "url": "http://127.0.0.1:{port}/sc/media/hls.json",
+                    }
+                ]
+            },
+        },
+    },
+]
+
+
+def sc_track_page(port: int) -> bytes:
+    """A track page carrying the hydration blob the resolver looks for."""
+    hydration = json.dumps(SC_HYDRATION).replace('{port}', str(port))
+    return (
+        '<!DOCTYPE html><html><head><title>Test Track</title></head><body>'
+        '<script>window.__sc_hydration = ' + hydration + ';</script>'
+        '</body></html>'
+    ).encode('utf-8')
+
+
+def sc_playlist() -> bytes:
+    lines = ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-TARGETDURATION:10', '#EXT-X-PLAYLIST-TYPE:VOD']
+    lines.append('#EXT-X-MAP:URI="init.mp4"')
+    for i in range(len(SC_SEGMENTS)):
+        lines.append('#EXTINF:10.0,')
+        lines.append(f'seg{i}.m4s')
+    lines.append('#EXT-X-ENDLIST')
+    return ('\n'.join(lines) + '\n').encode('utf-8')
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -129,6 +197,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, HTML_PAGE, 'audio/mpeg')
         if path == '/boom.mp3':
             return self._send(500, b'internal error', 'text/plain')
+
+        # ── SoundCloud-shaped tree ────────────────────────────────────────────
+        if path == '/sc/track':
+            return self._send(200, sc_track_page(self.server.server_port), 'text/html; charset=utf-8')
+        if path == '/sc/media/hls.json':
+            # The transcoding endpoint the resolver calls with ?client_id=…
+            playlist_url = f'http://127.0.0.1:{self.server.server_port}/sc/playlist.m3u8'
+            return self._send(200, json.dumps({'url': playlist_url}).encode(), 'application/json')
+        if path == '/sc/playlist.m3u8':
+            return self._send(200, sc_playlist(), 'application/vnd.apple.mpegurl')
+        if path == '/sc/init.mp4':
+            return self._send(200, SC_INIT, 'video/mp4')
+        m = re.fullmatch(r'/sc/seg(\d+)\.m4s', path)
+        if m:
+            index = int(m.group(1))
+            if 0 <= index < len(SC_SEGMENTS):
+                return self._send(200, SC_SEGMENTS[index], 'video/iso.segment')
+
         return self._send(404, b'not found', 'text/plain')
 
     def do_HEAD(self):
