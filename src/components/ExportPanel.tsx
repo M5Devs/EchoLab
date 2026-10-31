@@ -18,15 +18,23 @@ export function ExportPanel() {
     if (!isLoaded) return;
     try {
       setIsExporting(true);
-      const blob = await getBlob();
+      let blob = await getBlob();
+      let ext: 'wav' | 'mp3' = format;
+      if (!blob && format === 'mp3') {
+        // Never leave the user with a dead export button: fall back to WAV,
+        // which needs no external encoder, and say so.
+        blob = await exportWav();
+        ext = 'wav';
+        toast.warning('MP3 encoding unavailable — exported as WAV instead');
+      }
       if (!blob) throw new Error('Export failed');
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${currentTrack?.name || 'echolab-master'}.${format}`;
+      a.download = `${currentTrack?.name || 'echolab-master'}.${ext}`;
       a.click();
       URL.revokeObjectURL(url);
-      toast.success(`Exported as ${format.toUpperCase()}`);
+      if (ext === format) toast.success(`Exported as ${ext.toUpperCase()}`);
     } catch (e) {
       console.error(e);
       toast.error('Export failed');

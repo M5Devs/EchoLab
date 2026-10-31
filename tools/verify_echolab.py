@@ -336,6 +336,112 @@ def run(upstream):
               e["feedback"] == 0.9 and e["time"] == 1.5 and e["tone"] == 8000 and e["mix"] == 1,
               str(e))
 
+        # ── 5b. FX bypass must be pitch/phase transparent ────────────────────
+        # Regression: the widener used to run the right channel through its
+        # Haas micro-delay even when disabled, comb-filtering the centre image
+        # (−3.75 dB on a mono sum) and colouring "bypassed" audio.
+        fx_bypass = page.evaluate(
+            """async () => {
+            const fx = await import('/src/utils/studioFx.ts');
+            const sr = 44100, n = sr * 2;
+            const out = {};
+
+            // Deterministic white noise, identical in L and R (perfectly centred).
+            const mk = (ctx) => {
+                const b = ctx.createBuffer(2, n, sr);
+                let seed = 424242;
+                const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+                for (let i = 0; i < n; i++) {
+                    const v = rnd() * 2 - 1;
+                    b.getChannelData(0)[i] = v;
+                    b.getChannelData(1)[i] = v;
+                }
+                return b;
+            };
+            const render = async (settings) => {
+                const ctx = new OfflineAudioContext(2, n, sr);
+                const chain = new fx.StudioFxChain(ctx, fx.normalizeStudioFx(settings), false);
+                const b = mk(ctx);
+                const s = ctx.createBufferSource();
+                s.buffer = b;
+                s.connect(chain.input);
+                chain.output.connect(ctx.destination);
+                s.start(0);
+                const r = await ctx.startRendering();
+                return r;
+            };
+            const monoRms = (buf, from, to) => {
+                const L = buf.getChannelData(0), R = buf.getChannelData(1);
+                let s = 0, c = 0;
+                for (let i = from; i < to; i++) { const v = (L[i] + R[i]) / 2; s += v * v; c++; }
+                return Math.sqrt(s / c);
+            };
+
+            const ref = await render({});
+            const off = await render({});
+            const from = sr, to = sr * 1.5;
+            out.refMono = monoRms(ref, from, to);
+            out.offMono = monoRms(off, from, to);
+            out.monoLossDb = 20 * Math.log10(out.offMono / out.refMono);
+
+            // Sample-for-sample: a bypassed rack must be the identity.
+            const a = ref.getChannelData(0), b0 = off.getChannelData(0);
+            const aR = ref.getChannelData(1), bR = off.getChannelData(1);
+            let maxDiff = 0;
+            for (let i = from; i < to; i++) {
+                maxDiff = Math.max(maxDiff,
+                    Math.abs(a[i] - b0[i]), Math.abs(aR[i] - bR[i]));
+            }
+            out.bypassMaxDiff = maxDiff;
+
+            // The widener must still do its job when engaged.
+            const wide = await render({ widener: { enabled: true, width: 2, delayMs: 12 } });
+            const wL = wide.getChannelData(0), wR = wide.getChannelData(1);
+            let stereoDiff = 0;
+            for (let i = from; i < to; i++) stereoDiff = Math.max(stereoDiff, Math.abs(wL[i] - wR[i]));
+            out.wideStereoDiff = stereoDiff;
+
+            const mono = await render({ widener: { enabled: true, width: 0, delayMs: 12 } });
+            const mL = mono.getChannelData(0), mR = mono.getChannelData(1);
+            let monoDiff = 0;
+            for (let i = from; i < to; i++) monoDiff = Math.max(monoDiff, Math.abs(mL[i] - mR[i]));
+            out.collapseMonoDiff = monoDiff;
+
+            // Chorus bypass: the LFO must not modulate the delay line while off.
+            // Render a steady tone and confirm the zero-crossing period is fixed.
+            const tone = async (settings) => {
+                const ctx = new OfflineAudioContext(2, sr, sr);
+                const chain = new fx.StudioFxChain(ctx, fx.normalizeStudioFx(settings), false);
+                const osc = ctx.createOscillator();
+                osc.frequency.value = 1000;
+                osc.connect(chain.input);
+                chain.output.connect(ctx.destination);
+                osc.start(0);
+                const r = await ctx.startRendering();
+                const d = r.getChannelData(0);
+                const zc = [];
+                for (let i = 1; i < d.length; i++) if (d[i - 1] <= 0 && d[i] > 0) zc.push(i);
+                const p = [];
+                for (let i = 1; i < zc.length; i++) p.push(zc[i] - zc[i - 1]);
+                return Math.max(...p) - Math.min(...p);
+            };
+            out.chorusOffSpread = await tone({});
+            out.chorusOnSpread = await tone({ chorus: { enabled: true, rate: 1, depth: 1, mix: 1 } });
+            return out;
+        }"""
+        )
+        check("bypassed FX rack is the identity (sample-exact)",
+              fx_bypass["bypassMaxDiff"] == 0, f"maxDiff={fx_bypass['bypassMaxDiff']}")
+        check("bypassed widener does not comb the centre image",
+              abs(fx_bypass["monoLossDb"]) < 0.01, f"{fx_bypass['monoLossDb']:.4f} dB")
+        check("widener still widens when engaged",
+              fx_bypass["wideStereoDiff"] > 0.1, f"{fx_bypass['wideStereoDiff']:.4f}")
+        check("widener width=0 collapses to mono",
+              fx_bypass["collapseMonoDiff"] < 1e-6, f"{fx_bypass['collapseMonoDiff']:.2e}")
+        check("bypassed chorus does not modulate the delay line",
+              fx_bypass["chorusOffSpread"] <= 1 and fx_bypass["chorusOnSpread"] > 5,
+              f"off={fx_bypass['chorusOffSpread']} on={fx_bypass['chorusOnSpread']}")
+
         # ── 6. Audio proxy URL rewriting ──────────────────────────────────────
         proxy_test = page.evaluate(
             """async () => {
@@ -512,6 +618,51 @@ def run(upstream):
             // Audio bridge element must exist and not be muted (mobile notif)
             out.bridgeMuted = engine.audioBridge.muted;
             out.bridgeInDom = engine.audioBridge.isConnected;
+
+            // MP3 export must produce a real, decodable MPEG stream. This is a
+            // regression guard for the lamejs `MPEGMode is not defined` crash.
+            try {
+                const mp3 = engine.exportMP3(rendered, rendered.sampleRate);
+                out.mp3Size = mp3.size;
+                out.mp3Type = mp3.type;
+                const bytes = new Uint8Array(await mp3.arrayBuffer());
+                // MPEG audio frame sync is 11 set bits.
+                out.mp3FrameSync = bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0;
+                let syncs = 0;
+                for (let i = 0; i < bytes.length - 1; i++) {
+                    if (bytes[i] === 0xff && (bytes[i + 1] & 0xe0) === 0xe0) syncs++;
+                }
+                out.mp3Syncs = syncs;
+                // And the browser's own decoder must accept it.
+                const probe = new AudioContext();
+                const decoded = await probe.decodeAudioData(bytes.buffer.slice(0));
+                out.mp3DecodedSeconds = decoded.duration;
+                await probe.close();
+                out.mp3Ok = true;
+            } catch (e) {
+                out.mp3Ok = false;
+                out.mp3Error = String(e && e.message || e);
+            }
+
+            // A track-only session (no main buffer) must still reach the master
+            // bus — otherwise playback is silent and the MediaStream (and thus
+            // the Android notification) never carries audio.
+            const engine2 = new AudioEngine();
+            const trackBuf = engine2.ctx.createBuffer(2, 44100 * 0.5, 44100);
+            for (let i = 0; i < trackBuf.length; i++) {
+                trackBuf.getChannelData(0)[i] = 0.5 * Math.sin((2 * Math.PI * 440 * i) / 44100);
+                trackBuf.getChannelData(1)[i] = 0.5 * Math.sin((2 * Math.PI * 440 * i) / 44100);
+            }
+            engine2.addTrack(trackBuf, 'track-only');
+            await engine2.resumeContext();
+            engine2.play();
+            await new Promise(r => setTimeout(r, 250));
+            const probeData = new Float32Array(engine2.analyser.fftSize);
+            engine2.analyser.getFloatTimeDomainData(probeData);
+            out.trackOnlyAnalyserPeak = Math.max(...Array.from(probeData).map(Math.abs));
+            out.trackOnlyBridgeStream = !!engine2.audioBridge.srcObject;
+            engine2.dispose();
+
             await engine.ctx.close();
             return out;
         }"""
@@ -525,6 +676,17 @@ def run(upstream):
               f"len={engine_test['renderLen']}")
         check("audio bridge not muted (OS notification survives)",
               engine_test["bridgeMuted"] is False and engine_test["bridgeInDom"] is True)
+        check("MP3 export produces a decodable MPEG stream",
+              engine_test.get("mp3Ok") is True
+              and engine_test["mp3FrameSync"] and engine_test["mp3Syncs"] > 10
+              and engine_test["mp3DecodedSeconds"] > 0.1,
+              f"size={engine_test.get('mp3Size')} syncs={engine_test.get('mp3Syncs')} "
+              f"decoded={engine_test.get('mp3DecodedSeconds')} err={engine_test.get('mp3Error')}")
+        check("MP3 blob is labelled audio/mpeg",
+              engine_test.get("mp3Type") == "audio/mpeg", str(engine_test.get("mp3Type")))
+        check("track-only session reaches the master bus (not silent)",
+              engine_test["trackOnlyAnalyserPeak"] > 1e-3 and engine_test["trackOnlyBridgeStream"] is True,
+              f"peak={engine_test['trackOnlyAnalyserPeak']:.4f}")
 
         # ── 9. Studio FX rack panel is present in the UI ──────────────────────
         page.wait_for_timeout(300)
