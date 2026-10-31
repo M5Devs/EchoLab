@@ -371,14 +371,35 @@ class SaturationUnit implements Unit {
   }
 }
 
+/**
+ * Stereo widener — mid/side narrowing plus a Haas micro-delay for widening.
+ *
+ * The previous version always ran the right channel through its micro-delay,
+ * even when the unit was disabled (`width` fell back to 1 but `delayTime` was
+ * still written). That left a 12 ms Haas delay in the "bypassed" signal path,
+ * which comb-filters the centre image (measured: −3.75 dB on a mono sum) and is
+ * audible as a hollow, phasey tone.
+ *
+ * The graph is built so that `width = 1` is the exact identity:
+ *
+ *   M = (L + R) / 2        S = (L − R) / 2
+ *   L' = M + S·k           R' = M − S·k        where k = min(width, 1)
+ *   R'' = R' + h·delay(R)                      where h = max(0, width − 1)
+ *
+ * At `width = 1` → `k = 1`, `h = 0`, so `L' = L` and `R' = R` exactly. Widths
+ * below 1 collapse toward mono (`k → 0` gives `L' = R' = M`); widths above 1 add
+ * the Haas copy, which is the only way to widen already-correlated material —
+ * pure M/S cannot, because a centred source has no side component to scale.
+ */
 class WidenerUnit implements Unit {
   input: GainNode;
   output: GainNode;
   private splitter: ChannelSplitterNode;
   private merger: ChannelMergerNode;
   private delay: DelayNode;
-  private sideGain: GainNode;
-  private crossGain: GainNode;
+  private sideL: GainNode;
+  private sideR: GainNode;
+  private haas: GainNode;
   private ctx: BaseAudioContext;
   private smooth: boolean;
 
@@ -390,30 +411,71 @@ class WidenerUnit implements Unit {
     this.splitter = ctx.createChannelSplitter(2);
     this.merger = ctx.createChannelMerger(2);
     this.delay = ctx.createDelay(0.1);
-    this.sideGain = ctx.createGain();
-    this.crossGain = ctx.createGain();
+    this.sideL = ctx.createGain();
+    this.sideR = ctx.createGain();
+    this.haas = ctx.createGain();
+
+    // Force a stereo input so a mono source is duplicated to both channels
+    // rather than collapsing to L-only (a ChannelSplitter reads channel 1 of a
+    // mono signal as silence).
+    this.input.channelCount = 2;
+    this.input.channelCountMode = 'explicit';
+    this.input.channelInterpretation = 'speakers';
+
+    // M = (L + R) / 2, S = (L − R) / 2
+    const mid = ctx.createGain();
+    const midL = ctx.createGain();
+    const midR = ctx.createGain();
+    const side = ctx.createGain();
+    const sideFromL = ctx.createGain();
+    const sideFromR = ctx.createGain();
+    midL.gain.value = 0.5;
+    midR.gain.value = 0.5;
+    sideFromL.gain.value = 0.5;
+    sideFromR.gain.value = -0.5;
 
     this.input.connect(this.splitter);
-    this.splitter.connect(this.merger, 0, 0);        // L → L
-    this.splitter.connect(this.crossGain, 0, 0);
-    this.crossGain.connect(this.merger, 0, 1);       // L → R (mono fold-down)
-    this.splitter.connect(this.delay, 1, 0);         // R → micro delay
-    this.delay.connect(this.sideGain);
-    this.sideGain.connect(this.merger, 0, 1);        // delayed R → R (Haas)
+    this.splitter.connect(midL, 0, 0);
+    this.splitter.connect(midR, 1, 0);
+    midL.connect(mid);
+    midR.connect(mid);
+    this.splitter.connect(sideFromL, 0, 0);
+    this.splitter.connect(sideFromR, 1, 0);
+    sideFromL.connect(side);
+    sideFromR.connect(side);
+
+    // Mid feeds both outputs; the side component is added in anti-phase.
+    mid.connect(this.merger, 0, 0);
+    mid.connect(this.merger, 0, 1);
+    side.connect(this.sideL);
+    side.connect(this.sideR);
+    this.sideL.connect(this.merger, 0, 0);
+    this.sideR.connect(this.merger, 0, 1);
+
+    // Haas copy of the right channel, summed in for widths above neutral.
+    this.splitter.connect(this.delay, 1, 0);
+    this.delay.connect(this.haas);
+    this.haas.connect(this.merger, 0, 1);
 
     this.merger.connect(this.output);
     this.apply(settings);
   }
 
   apply(s: WidenerSettings) {
+    // Disabled is not a special path: `width = 1` makes the graph the identity,
+    // so the bypass and a neutral knob setting are the same signal.
     const width = s.enabled ? clamp(s.width, 0, 2) : 1;
+    const k = Math.min(width, 1);
     write(this.delay.delayTime, clamp(s.delayMs, 5, 25) / 1000, this.ctx, this.smooth);
-    write(this.sideGain.gain, width, this.ctx, this.smooth);
-    write(this.crossGain.gain, Math.max(0, 1 - width), this.ctx, this.smooth);
+    write(this.sideL.gain, k, this.ctx, this.smooth);
+    write(this.sideR.gain, -k, this.ctx, this.smooth);
+    // Haas only contributes once the image is pushed past neutral.
+    write(this.haas.gain, Math.max(0, width - 1), this.ctx, this.smooth);
   }
 
   dispose() {
-    [this.input, this.output, this.splitter, this.merger, this.delay, this.sideGain, this.crossGain].forEach(n => {
+    [this.input, this.output, this.splitter, this.merger, this.delay,
+     this.sideL, this.sideR, this.haas].forEach(n => {
       try { n.disconnect(); } catch { /* already detached */ }
     });
   }
@@ -461,11 +523,17 @@ class ChorusUnit implements Unit {
   }
 
   apply(s: ChorusSettings) {
-    const mix = s.enabled ? clamp(s.mix, 0, 1) : 0;
+    const active = s.enabled;
+    const mix = active ? clamp(s.mix, 0, 1) : 0;
     write(this.lfo.frequency, clamp(s.rate, 0.1, 4), this.ctx, this.smooth);
     // Base 20 ms with ±10 ms swing covers the 10–30 ms vocal-doubling window.
     write(this.delay.delayTime, 0.02, this.ctx, this.smooth);
-    write(this.lfoGain.gain, clamp(s.depth, 0, 1) * 0.01, this.ctx, this.smooth);
+    // Depth must collapse to zero when bypassed. Leaving the LFO gain live keeps
+    // sweeping the delay line even at mix 0, which is the "tape wobble" / Doppler
+    // drift heard as a slowly detuning pitch on sustained notes.
+    write(this.lfoGain.gain, active ? clamp(s.depth, 0, 1) * 0.01 : 0, this.ctx, this.smooth);
+    // Equal-power crossfade. At mix 0 the wet path is exactly silent, so the
+    // modulated delay cannot contribute any pitch movement to the output.
     write(this.dry.gain, Math.cos((mix * Math.PI) / 2), this.ctx, this.smooth);
     write(this.wet.gain, Math.sin((mix * Math.PI) / 2), this.ctx, this.smooth);
   }

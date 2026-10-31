@@ -13,12 +13,12 @@
     "test:client": "node --experimental-transform-types --import ./tools/register_ts_resolve.mjs tools/test_audio_proxy_client.mjs"
   },
   "dependencies": {
+    "@breezystack/lamejs": "1.2.7",
     "buffer": "^6.0.3",
     "eruda": "^3.4.3",
     "firebase": "^12.16.0",
     "idb": "^8.0.3",
     "jszip": "^3.10.1",
-    "lamejs": "^1.2.1",
     "music-metadata": "^10.0.0"
   },
   "devDependencies": {

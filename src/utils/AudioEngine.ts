@@ -1,5 +1,5 @@
 import { audioBufferToWav } from './audioBufferToWav';
-import lamejs from 'lamejs';
+import { Mp3Encoder } from '@breezystack/lamejs';
 import { openDB, DBSchema, IDBPDatabase } from 'idb';
 import {
   StudioFxChain,
@@ -242,6 +242,10 @@ export class AudioEngine {
         db.createObjectStore('projects', { keyPath: 'id' });
       },
     });
+
+    // Build the static master bus up front so a track-only session (which never
+    // calls connectNodes) still reaches the speakers and the MediaStream.
+    this.mountStudioFx();
 
     this.parseHashSettings();
   }
@@ -537,14 +541,21 @@ export class AudioEngine {
     this.reverbMix.connect(this.pannerNode);
 
     this.pannerNode.connect(this.compressorNode);
-    this.compressorNode.connect(this.volumeNode);
 
     // The studio FX rack sits post-compressor, pre-analysis, so the visualizer
     // and the exported file both reflect what the user hears.
     this.mountStudioFx();
   }
 
-  /** (Re)build and insert the studio FX rack into the live master chain. */
+  /**
+   * (Re)build and insert the studio FX rack into the live master chain.
+   *
+   * This owns the whole static master bus — `compressor → volume → FX rack →
+   * analyser → output` — rather than leaving the `compressor → volume` link to
+   * `connectNodes()`. A track-only session never calls `connectNodes()`, so
+   * without this the bus was never completed: playback was silent and the
+   * MediaStream stayed empty, which is why Android showed no notification.
+   */
   private mountStudioFx() {
     if (this.studioFxChain) {
       this.studioFxChain.dispose();
@@ -558,16 +569,32 @@ export class AudioEngine {
     this.volumeNode.connect(chain.input);
     chain.output.connect(this.analyser);
 
-    // Preferred route: a MediaStream feeding the hidden <audio> element, which
-    // is what keeps the mobile OS transport (notification, lock screen, headset
-    // buttons) alive. If the browser has no MediaStreamAudioDestination we fall
-    // back to the plain hardware output so playback is still audible.
+    try {
+      this.compressorNode.disconnect(this.volumeNode);
+    } catch (e) {}
+    this.compressorNode.connect(this.volumeNode);
+
+    this.studioFxChain = chain;
+    this.connectMasterOutput();
+  }
+
+  /**
+   * Route the analyser (the true end of the master bus) to the OS.
+   *
+   * Preferred route: a MediaStream feeding the hidden `<audio>` element, which
+   * is what keeps the mobile OS transport (notification, lock screen, headset
+   * buttons) alive. If the browser has no MediaStreamAudioDestination we fall
+   * back to the plain hardware output so playback is still audible.
+   */
+  private connectMasterOutput() {
+    try {
+      this.analyser.disconnect();
+    } catch (e) {}
     if (this.mediaStreamDestination) {
       this.analyser.connect(this.mediaStreamDestination);
     } else {
       this.analyser.connect(this.ctx.destination);
     }
-    this.studioFxChain = chain;
   }
 
   /**
@@ -1186,32 +1213,63 @@ export class AudioEngine {
     return audioBufferToWav(renderedBuffer);
   }
 
+  /**
+   * Encode an AudioBuffer to MP3 via lamejs.
+   *
+   * The upstream `lamejs` 1.2.1 package ships a broken CJS build: `Lame.js`
+   * references a bare `MPEGMode` global it never requires, so constructing an
+   * encoder throws `ReferenceError: MPEGMode is not defined` as soon as the
+   * module is bundled for the browser. We use the maintained
+   * `@breezystack/lamejs` fork, which ships a correct ESM build.
+   */
   exportMP3(buffer: AudioBuffer, sampleRate: number): Blob {
-    const mp3encoder = new lamejs.Mp3Encoder(buffer.numberOfChannels, sampleRate, 320);
-    const mp3Data = [];
+    const channels = Math.min(Math.max(buffer.numberOfChannels, 1), 2);
+    // 320 kbps is the practical ceiling for MPEG-1 Layer III at 44.1/48 kHz.
+    const kbps = sampleRate >= 32000 ? 320 : 160;
+    const encoder = new Mp3Encoder(channels, sampleRate, kbps);
 
     const left = buffer.getChannelData(0);
-    const right = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : left;
+    const right = channels > 1 ? buffer.getChannelData(1) : left;
 
     const sampleBlockSize = 1152;
     const leftInt16 = new Int16Array(left.length);
     const rightInt16 = new Int16Array(right.length);
 
+    // Clamp before scaling: a sample outside [-1, 1] would otherwise wrap
+    // around to the opposite polarity and produce a loud click in the export.
     for (let i = 0; i < left.length; i++) {
-      leftInt16[i] = left[i] < 0 ? left[i] * 0x8000 : left[i] * 0x7FFF;
-      rightInt16[i] = right[i] < 0 ? right[i] * 0x8000 : right[i] * 0x7FFF;
+      const l = Math.max(-1, Math.min(1, left[i]));
+      const r = Math.max(-1, Math.min(1, right[i]));
+      leftInt16[i] = l < 0 ? l * 0x8000 : l * 0x7fff;
+      rightInt16[i] = r < 0 ? r * 0x8000 : r * 0x7fff;
     }
 
+    const chunks: Uint8Array[] = [];
     for (let i = 0; i < leftInt16.length; i += sampleBlockSize) {
       const leftChunk = leftInt16.subarray(i, i + sampleBlockSize);
       const rightChunk = rightInt16.subarray(i, i + sampleBlockSize);
-      const mp3buf = mp3encoder.encodeBuffer(leftChunk, rightChunk);
-      if (mp3buf.length > 0) mp3Data.push(mp3buf);
+      const mp3buf = channels > 1
+        ? encoder.encodeBuffer(leftChunk, rightChunk)
+        : encoder.encodeBuffer(leftChunk);
+      if (mp3buf.length > 0) chunks.push(mp3buf);
     }
-    const mp3buf = mp3encoder.flush();
-    if (mp3buf.length > 0) mp3Data.push(mp3buf);
+    const tail = encoder.flush();
+    if (tail.length > 0) chunks.push(tail);
 
-    return new Blob(mp3Data, { type: 'audio/mp3' });
+    if (chunks.length === 0) {
+      throw new Error('MP3 encoder produced no output');
+    }
+    // Merge into one contiguous buffer: lamejs hands back many small views, and
+    // a single ArrayBuffer is both cheaper for the Blob and avoids the
+    // ArrayBufferLike variance that `new Blob(chunks)` trips in TS 5.7+.
+    const total = chunks.reduce((sum, c) => sum + c.length, 0);
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return new Blob([merged.buffer], { type: 'audio/mpeg' });
   }
 
   async saveProject(name: string, playlists: any[] = []) {
