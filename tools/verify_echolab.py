@@ -967,22 +967,39 @@ def run(upstream):
               len(ms_invoke["errors"]) == 0, str(ms_invoke["errors"]))
 
         # The handlers must actually drive playback, not merely avoid throwing.
-        # 'play' was invoked last, so the engine and the keep-alive element
-        # should both now be running and the OS state should read 'playing'.
+        # 'play' was invoked last, so the keep-alive element should be running
+        # and the OS transport should have been driven to 'playing'. The handler
+        # is async (previoustrack/nexttrack trigger a track load, and 'play'
+        # awaits resumeContext), so poll for the state instead of sampling once.
+        # The 1 s fixture can finish during the poll, which legitimately flips
+        # playbackState back to 'paused'; capture that it *reached* 'playing'.
         ms_effect = page.evaluate(
             """async () => {
-            await new Promise(r => setTimeout(r, 250));
-            const el = document.querySelector('audio');
-            return {
-                bridgePaused: el ? el.paused : null,
-                playbackState: navigator.mediaSession ? navigator.mediaSession.playbackState : null,
-                metadataTitle: navigator.mediaSession && navigator.mediaSession.metadata
-                    ? navigator.mediaSession.metadata.title : null,
+            const read = () => {
+                const el = document.querySelector('audio');
+                return {
+                    bridgePaused: el ? el.paused : null,
+                    playbackState: navigator.mediaSession ? navigator.mediaSession.playbackState : null,
+                    metadataTitle: navigator.mediaSession && navigator.mediaSession.metadata
+                        ? navigator.mediaSession.metadata.title : null,
+                };
             };
+            let sawPlaying = false;
+            let last = read();
+            const deadline = performance.now() + 800;
+            while (performance.now() < deadline) {
+                if (last.playbackState === 'playing') sawPlaying = true;
+                if (sawPlaying && last.bridgePaused === false) break;
+                await new Promise(r => setTimeout(r, 40));
+                last = read();
+            }
+            if (last.playbackState === 'playing') sawPlaying = true;
+            last.sawPlaying = sawPlaying;
+            return last;
         }"""
         )
         check("mediaSession 'play' handler actually starts playback",
-              ms_effect["bridgePaused"] is False and ms_effect["playbackState"] == "playing",
+              ms_effect["bridgePaused"] is False and ms_effect["sawPlaying"],
               json.dumps(ms_effect))
 
         ms_pos = page.evaluate(

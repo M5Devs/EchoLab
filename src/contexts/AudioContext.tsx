@@ -287,6 +287,21 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
     await loadTrack(prevTrack);
   }, [activePlaylistId, currentTrack, playlists, isShuffle, isRepeat, loadTrack]);
 
+  // The engine's ended/state callbacks are installed exactly once and read the
+  // latest context through a ref. They used to live in an effect whose cleanup
+  // called `engine.stop()`, so *every* dependency change tore playback down —
+  // and each track load commits `currentTrack`/`playlists`, so the effect
+  // cleanup fired right after `loadTrack()` started playback and the track
+  // silently appeared to load without playing. Nothing here stops the transport;
+  // `loadTrack` already stops before loading, and the real unmount is handled by
+  // the dispose effect below.
+  const endedCtxRef = useRef({
+    activePlaylistId, currentTrack, playlists, isShuffle, isRepeat, loadTrack,
+  });
+  endedCtxRef.current = {
+    activePlaylistId, currentTrack, playlists, isShuffle, isRepeat, loadTrack,
+  };
+
   useEffect(() => {
     const engine = engineRef.current;
 
@@ -294,23 +309,28 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
       updateState();
 
       // Auto play next track if there is an active playlist and we have a next track
-      if (activePlaylistId && currentTrack) {
-        const activePlaylist = playlists.find(p => p.id === activePlaylistId);
+      const {
+        activePlaylistId: playlistId,
+        currentTrack: track,
+        playlists: allPlaylists,
+        isShuffle: shuffle,
+        isRepeat: repeat,
+        loadTrack: load,
+      } = endedCtxRef.current;
+      if (playlistId && track) {
+        const activePlaylist = allPlaylists.find(p => p.id === playlistId);
         if (activePlaylist && activePlaylist.tracks.length > 0) {
-          if (isShuffle && activePlaylist.tracks.length > 1) {
-            const otherTracks = activePlaylist.tracks.filter(t => t.id !== currentTrack.id);
-            const nextTrack = otherTracks[Math.floor(Math.random() * otherTracks.length)];
-            loadTrack(nextTrack);
+          if (shuffle && activePlaylist.tracks.length > 1) {
+            const otherTracks = activePlaylist.tracks.filter(t => t.id !== track.id);
+            load(otherTracks[Math.floor(Math.random() * otherTracks.length)]);
           } else {
-            const currentIndex = activePlaylist.tracks.findIndex(t => t.id === currentTrack.id);
+            const currentIndex = activePlaylist.tracks.findIndex(t => t.id === track.id);
             if (currentIndex !== -1) {
               const nextIndex = currentIndex + 1;
               if (nextIndex < activePlaylist.tracks.length) {
-                const nextTrack = activePlaylist.tracks[nextIndex];
-                loadTrack(nextTrack);
-              } else if (isRepeat) {
-                const nextTrack = activePlaylist.tracks[0];
-                loadTrack(nextTrack);
+                load(activePlaylist.tracks[nextIndex]);
+              } else if (repeat) {
+                load(activePlaylist.tracks[0]);
               }
             }
           }
@@ -322,18 +342,15 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
     engine.onStateChange = updateState;
 
     engine.listProjects().then(setProjects);
-
-    return () => {
-      engine.stop();
-    };
-  }, [updateState, activePlaylistId, currentTrack, playlists, loadTrack]);
+  }, [updateState]);
 
   // Release the AudioContext, oscillators, FX rack and hidden bridge element on
-  // real unmount only. This must not live in the engine-wiring effect above,
-  // whose cleanup also runs on every dependency change.
+  // real unmount only. Stopping the transport belongs here too: it must happen
+  // when the provider goes away, not on every render dependency change.
   useEffect(() => {
     const engine = engineRef.current;
     return () => {
+      engine.stop();
       engine.dispose();
     };
   }, []);
@@ -359,15 +376,27 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
 
   // ── Media Session Integration ──────────────────────────────────────────────
   // Drives the Android notification drawer, lock screen and Bluetooth/headset
-  // buttons. The master bus already feeds a MediaStreamAudioDestination that a
-  // hidden <audio> element plays (see AudioEngine), which is what keeps the OS
-  // transport alive while the Web Audio graph does the actual processing.
+  // buttons. Web Audio is the audible output; a hidden <audio> element loops a
+  // silent clip so Android keeps the media session alive in the background (see
+  // AudioEngine.startBridge).
+
+  // Latest track-navigation callbacks, read through refs so the action handlers
+  // below can be registered exactly once. Re-registering on every track change
+  // (the previous approach) leaves a window where no handler is installed, and a
+  // headset button pressed in that window does nothing.
+  const mediaNavRef = useRef({ playNextTrack, playPreviousTrack });
+  mediaNavRef.current = { playNextTrack, playPreviousTrack };
+
   useEffect(() => {
     if (!('mediaSession' in navigator)) return;
 
     if (currentTrack) {
+      // Derive the artwork MIME from the data URI rather than assuming PNG: a
+      // JPEG cover declared as image/png is rejected by some lock screens, which
+      // then show no artwork at all.
+      const coverType = /^data:(image\/[a-z0-9.+-]+)/i.exec(currentTrack.coverArt || '')?.[1];
       const artwork = currentTrack.coverArt
-        ? [{ src: currentTrack.coverArt, sizes: '512x512', type: 'image/png' }]
+        ? [{ src: currentTrack.coverArt, sizes: '512x512', type: coverType || 'image/png' }]
         : [
             { src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png' },
             { src: '/pwa-512x512.png', sizes: '512x512', type: 'image/png' },
@@ -423,12 +452,17 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
       }
     };
 
+    // Publish once immediately so a play/pause reflects on the lock screen at
+    // once, then keep the position fresh on a slow poll (playback advances
+    // without React re-rendering, so a timer is the only source of truth).
     sync();
     const interval = window.setInterval(sync, 1000);
     return () => window.clearInterval(interval);
   }, [isPlaying, isLoaded]);
 
   // Action handlers — these are what headset and lock-screen buttons dispatch.
+  // They only ever touch the engine, which is the single source of truth for
+  // playback state, so the lock screen and the in-app controls stay in lockstep.
   useEffect(() => {
     if (!('mediaSession' in navigator)) return;
 
@@ -452,7 +486,7 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
       [
         'pause',
         () => {
-          if (engineRef.current.isPlaying) engineRef.current.pause();
+          engineRef.current.pause();
         },
       ],
       [
@@ -465,8 +499,8 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
       ],
       ['seekforward', (details) => seekBy(details.seekOffset ?? 10)],
       ['seekbackward', (details) => seekBy(-(details.seekOffset ?? 10))],
-      ['previoustrack', () => { playPreviousTrack(); }],
-      ['nexttrack', () => { playNextTrack(); }],
+      ['previoustrack', () => { void mediaNavRef.current.playPreviousTrack(); }],
+      ['nexttrack', () => { void mediaNavRef.current.playNextTrack(); }],
     ];
 
     for (const [action, handler] of actionHandlers) {
@@ -484,7 +518,7 @@ export function AudioProvider({ children }: { children: React.ReactNode }) {
         } catch (e) {}
       }
     };
-  }, [playNextTrack, playPreviousTrack]);
+  }, []);
 
 
   const togglePlay = () => {
