@@ -3,6 +3,17 @@ import { useAudio } from '../contexts/AudioContext';
 import { Slider } from './ui/slider';
 import { useEffect, useState, useRef } from 'react';
 
+/**
+ * Progress is repainted at ~10 Hz, not on every animation frame.
+ *
+ * The previous loop called `setProgress` 60×/s, which re-rendered this component
+ * (and its subtree) at display refresh rate for the entire duration of playback.
+ * That is exactly the main-thread load that starves the audio graph on a phone.
+ * A 100 ms cadence is imperceptible on a time readout and leaves the main thread
+ * free; the playhead smoothness lives in the canvas overlays, which are not React.
+ */
+const PROGRESS_INTERVAL_MS = 100;
+
 export function AudioControls() {
   const { isPlaying, isLoaded, togglePlay, stop, seek, engine, exportWav, currentTrack, playNextTrack, playPreviousTrack } = useAudio();
   const [progress, setProgress] = useState(0);
@@ -10,6 +21,7 @@ export function AudioControls() {
   const [isExporting, setIsExporting] = useState(false);
   const rafRef = useRef<number>(0);
   const isSeekingRef = useRef(false);
+  const lastPaintRef = useRef(0);
 
   useEffect(() => {
     if (!isLoaded) {
@@ -19,14 +31,15 @@ export function AudioControls() {
     }
 
     setDuration(engine.getDuration() / engine.effects.speed);
+    lastPaintRef.current = 0;
 
-    const updateProgress = () => {
-      if (engine.isPlaying && !isSeekingRef.current) {
-        setProgress(engine.getCurrentTime() / engine.effects.speed);
-      } else if (!engine.isPlaying && !isSeekingRef.current) {
-        setProgress(engine.getCurrentTime() / engine.effects.speed);
+    const updateProgress = (now: number) => {
+      if (!isSeekingRef.current && now - lastPaintRef.current >= PROGRESS_INTERVAL_MS) {
+        lastPaintRef.current = now;
+        const speed = engine.effects.speed || 1;
+        setProgress(engine.getCurrentTime() / speed);
+        setDuration(engine.getDuration() / speed);
       }
-      setDuration(engine.getDuration() / engine.effects.speed);
       rafRef.current = requestAnimationFrame(updateProgress);
     };
 

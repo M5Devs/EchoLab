@@ -144,6 +144,17 @@ export function silentWavDataUri(seconds = 1, sampleRate = 8000): string {
 /** Keep-alive element gain: audible to Android's "is this playing?" check, imperceptible to humans. */
 export const BRIDGE_VOLUME = 0.01;
 
+/**
+ * Transport de-click ramp, in seconds.
+ *
+ * A buffer source that starts or stops at an arbitrary sample produces a step
+ * discontinuity in the waveform — a click/pop. Enveloping the whole master bus
+ * with a short linear ramp (start: 0 → 1, stop: 1 → 0) makes the transition
+ * continuous instead. ~8 ms is long enough to be inaudible as a click and short
+ * enough to feel instantaneous.
+ */
+export const TRANSPORT_FADE = 0.008;
+
 export interface Track {
   id: string;
   name: string;
@@ -206,6 +217,25 @@ export class AudioEngine {
   compressorNode: DynamicsCompressorNode;
   volumeNode: GainNode;
 
+  /**
+   * Master transport envelope. Sits at the very end of the master bus, after the
+   * user's volume, and exists purely to de-click start/stop/seek: it is ramped
+   * 0 → 1 on play and 1 → 0 before every source stop. Kept separate from
+   * `volumeNode` so the user's volume setting and the transport envelope never
+   * fight over the same AudioParam.
+   */
+  transportGain: GainNode;
+  /** Pending fade-out teardown; cancelled if playback restarts before it fires. */
+  private teardownTimer: number | null = null;
+  /**
+   * Transport generation counter. Every play/pause/stop/seek bumps it; a deferred
+   * step (a seek's fade-out→restart) captures the value and no-ops if a newer
+   * transport call has superseded it. Without this, seeking and immediately
+   * pausing would let the seek's scheduled restart fire *after* the pause and
+   * silently resume playback.
+   */
+  private transportToken = 0;
+
   channelMerger: ChannelMergerNode;
   tracks: Track[] = [];
 
@@ -238,7 +268,14 @@ export class AudioEngine {
   isLooping = false;
 
   constructor() {
-    this.ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    // `latencyHint: 'playback'` asks the platform for the largest, most stable
+    // buffer it can give us. The default ('interactive') runs a much smaller
+    // buffer, which is the right trade-off for live monitoring but leaves almost
+    // no headroom: any main-thread hitch (a React re-render, a GC pause) drains
+    // it and is heard as a crackle/underrun. Playback of a decoded file needs no
+    // such low latency, so we take the stability instead.
+    const AudioCtor = window.AudioContext || (window as any).webkitAudioContext;
+    this.ctx = new AudioCtor({ latencyHint: 'playback' });
 
     this.highpassNode = this.ctx.createBiquadFilter();
     this.highpassNode.type = 'highpass';
@@ -280,6 +317,10 @@ export class AudioEngine {
 
     this.compressorNode = this.ctx.createDynamicsCompressor();
     this.volumeNode = this.ctx.createGain();
+    this.transportGain = this.ctx.createGain();
+    // Silence by default; play() ramps it up. Starting at 1 would let the first
+    // source start as a hard step (a click) before any envelope is applied.
+    this.transportGain.gain.value = 0;
 
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 2048;
@@ -321,6 +362,8 @@ export class AudioEngine {
     // calls connectNodes) still reaches the speakers and the MediaStream.
     this.mountStudioFx();
 
+    this.installLifecycleListeners();
+
     this.parseHashSettings();
   }
 
@@ -350,6 +393,62 @@ export class AudioEngine {
     if (this.ctx.state === 'suspended') {
       await this.ctx.resume();
     }
+  }
+
+  /**
+   * Start the hidden keep-alive media element.
+   *
+   * Android Chrome only keeps the Web Audio graph alive in the background (and
+   * only raises lock-screen / headset transport) while a media element is playing,
+   * so this element loops a silent clip for the whole session. It must be started
+   * from a user gesture; callers resume the AudioContext first.
+   */
+  private startBridge() {
+    if (!this.audioBridge) return;
+    const started = this.audioBridge.play();
+    if (started && typeof started.catch === 'function') {
+      started.catch(e => {
+        console.warn('AudioBridge keep-alive play failed:', e);
+      });
+    }
+  }
+
+  /** Stop the keep-alive element so the OS drops the media session. */
+  private pauseBridge() {
+    try {
+      this.audioBridge?.pause();
+    } catch (e) {}
+  }
+
+  /**
+   * Keep the transport alive across the interruptions Android/Chrome throws at
+   * a backgrounded tab.
+   *
+   * While the screen is off the platform may suspend the AudioContext. If the
+   * user is still nominally playing, resume it as soon as we regain visibility or
+   * a page-level resume arrives — otherwise playback silently stays dead even
+   * though the media session (and the lock-screen button) still reads "playing".
+   * A real `pause()` deliberately leaves the context suspended, so the
+   * `isPlaying` guard is what distinguishes an interruption from a user action.
+   */
+  private lifecycleHandler = () => {
+    if (!this.isPlaying) return;
+    // Only act once a display is actually back; the hidden transition itself
+    // must not trigger a resume.
+    if (document.visibilityState === 'hidden') return;
+    void this.resumeContext();
+  };
+
+  private installLifecycleListeners() {
+    if (typeof document === 'undefined') return;
+    document.addEventListener('visibilitychange', this.lifecycleHandler);
+    window.addEventListener('focus', this.lifecycleHandler);
+  }
+
+  private removeLifecycleListeners() {
+    if (typeof document === 'undefined') return;
+    document.removeEventListener('visibilitychange', this.lifecycleHandler);
+    window.removeEventListener('focus', this.lifecycleHandler);
   }
 
   async loadBuffer(arrayBuffer: ArrayBuffer, contentType?: string | null) {
@@ -647,7 +746,10 @@ export class AudioEngine {
 
     const chain = new StudioFxChain(this.ctx, this.studioFx, true);
     this.volumeNode.connect(chain.input);
-    chain.output.connect(this.analyser);
+    // The transport envelope is the last gain stage before the analyser, so both
+    // what the user hears and what the visualizer sees carry the de-click ramp.
+    chain.output.connect(this.transportGain);
+    this.transportGain.connect(this.analyser);
 
     try {
       this.compressorNode.disconnect(this.volumeNode);
@@ -697,23 +799,76 @@ export class AudioEngine {
   }
 
 
+  /**
+   * Ramp the master transport envelope to `target` and, for a fade-out, run
+   * `afterFade` once the ramp has completed. `linearRampToValueAtTime` is used
+   * (not `setTargetAtTime`) because it reaches the target exactly at the given
+   * time, which is what lets us stop the source precisely when the bus is silent.
+   */
+  private rampTransport(target: number, seconds = TRANSPORT_FADE, afterFade?: () => void) {
+    const now = this.ctx.currentTime;
+    const param = this.transportGain.gain;
+    try {
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(param.value, now);
+      param.linearRampToValueAtTime(target, now + seconds);
+    } catch (e) {
+      param.value = target;
+    }
+    if (afterFade) {
+      if (seconds <= 0) {
+        afterFade();
+      } else {
+        this.cancelPendingTeardown();
+        this.teardownTimer = window.setTimeout(afterFade, seconds * 1000 + 20);
+      }
+    }
+  }
+
+  /** Cancel a scheduled fade-out teardown (a new play()/seek() supersedes it). */
+  private cancelPendingTeardown() {
+    if (this.teardownTimer !== null) {
+      window.clearTimeout(this.teardownTimer);
+      this.teardownTimer = null;
+    }
+  }
+
+  /**
+   * Stop the current source(s) and detach the per-play graph. Called after the
+   * transport envelope has already faded to zero, so the abrupt `stop()` happens
+   * while the bus is silent and cannot click.
+   */
+  private teardownSources() {
+    if (this.source) {
+      try { this.source.onended = null; this.source.stop(); } catch (e) {}
+      this.source = null;
+    }
+    this.tracks.forEach(track => {
+      if (track.sourceNode) {
+        try { track.sourceNode.stop(); } catch (e) {}
+        track.sourceNode = undefined;
+      }
+    });
+  }
+
   play() {
     if (!this.buffer && this.tracks.length === 0) return;
     this.resumeContext();
+    this.transportToken++;
+
+    // A fade-out teardown scheduled by a previous pause()/stop()/seek() must not
+    // fire after this restart and kill the sources we are about to start, and any
+    // source still lingering from that fade-out must be stopped before we build a
+    // new one (otherwise the old source keeps sounding under the new one).
+    this.cancelPendingTeardown();
+    this.teardownSources();
 
     // Start the silent keep-alive clip inside the user gesture. Web Audio (not
     // this element) is what produces the audible output; the element exists so
     // Android Chrome raises and retains the media notification / lock-screen
     // transport. It must be started from a real user gesture or the browser
     // suspends it and drops the session.
-    if (this.audioBridge) {
-      const started = this.audioBridge.play();
-      if (started && typeof started.catch === 'function') {
-        started.catch(e => {
-          console.warn('AudioBridge keep-alive play failed:', e);
-        });
-      }
-    }
+    this.startBridge();
 
     const offset = this.pauseTime;
 
@@ -731,6 +886,11 @@ export class AudioEngine {
         if (this.isPlaying && this.getCurrentTime() >= this.getDuration()) {
           this.isPlaying = false;
           this.pauseTime = 0;
+          // Deliberately keep the silent keep-alive element running: it is what
+          // holds the OS media session (and thus the lock-screen / headset
+          // controls) open so the user can replay from the notification. The
+          // mediaSession playbackState is driven to 'paused' by the sync loop,
+          // so the session still reads as ended.
           this.onEnded();
           this.onStateChange();
         }
@@ -781,62 +941,63 @@ export class AudioEngine {
 
     this.startTime = this.ctx.currentTime - (offset / this.effects.speed);
     this.isPlaying = true;
+    // Fade the bus in from silence so the first sample is not a step.
+    this.rampTransport(1);
     this.onStateChange();
   }
 
   pause() {
-    if (!this.isPlaying) return;
-
-    if (this.audioBridge) {
-      this.audioBridge.pause();
+    // Bump/cancel even when not playing: a seek() in flight has already set
+    // `isPlaying = false` and scheduled a restart, and a pause that lands during
+    // that window must abort it rather than let playback resume.
+    this.transportToken++;
+    const hadPendingTeardown = this.teardownTimer !== null;
+    this.cancelPendingTeardown();
+    if (!this.isPlaying) {
+      // Aborting an in-flight seek: the bus is already fading to silence, so
+      // tear the (now inaudible) sources down and leave the playhead where the
+      // seek put it.
+      if (hadPendingTeardown) this.teardownSources();
+      return;
     }
+
+    this.pauseBridge();
+    // Freeze the playhead at the moment the ramp begins so a resume continues
+    // from what the user actually heard, then fade the bus out before stopping
+    // the sources — stopping them at full gain is the classic click.
     this.pauseTime = this.getCurrentTime();
-
-    if (this.source) {
-      try { this.source.stop(); } catch (e) {}
-      this.source = null;
-    }
-
-    this.tracks.forEach(track => {
-      if (track.sourceNode) {
-        try { track.sourceNode.stop(); } catch (e) {}
-        track.sourceNode = undefined;
-      }
-    });
-
     this.isPlaying = false;
+    this.rampTransport(0, TRANSPORT_FADE, () => this.teardownSources());
     this.onStateChange();
   }
 
   stop() {
-    if (this.audioBridge) {
-      this.audioBridge.pause();
-    }
-
-    if (this.source) {
-      try { this.source.stop(); } catch (e) {}
-      this.source = null;
-    }
-
-    this.tracks.forEach(track => {
-      if (track.sourceNode) {
-        try { track.sourceNode.stop(); } catch (e) {}
-        track.sourceNode = undefined;
-      }
-    });
+    this.transportToken++;
+    this.pauseBridge();
 
     this.pauseTime = 0;
     this.isPlaying = false;
+    // Same fade-then-stop as pause(); `stop` additionally rewinds to 0.
+    this.rampTransport(0, TRANSPORT_FADE, () => this.teardownSources());
     this.onStateChange();
   }
 
   seek(time: number) {
     if (this.isPlaying) {
-      this.pause();
-      this.pauseTime = time;
-      this.play();
+      // Fade out, then rebuild at the new position and fade back in. Calling
+      // pause()+play() directly would stop the source at full gain (click) and
+      // restart it at full gain (second click).
+      const token = ++this.transportToken;
+      this.pauseTime = Math.max(0, time);
+      this.isPlaying = false;
+      this.rampTransport(0, TRANSPORT_FADE, () => {
+        // A pause()/stop() that arrived during the fade-out must win.
+        if (token !== this.transportToken) return;
+        this.teardownSources();
+        this.play();
+      });
     } else {
-      this.pauseTime = time;
+      this.pauseTime = Math.max(0, time);
     }
   }
 
@@ -855,28 +1016,56 @@ export class AudioEngine {
     return maxDur;
   }
 
+  /**
+   * Reused analysis buffers.
+   *
+   * The visualizers poll these getters at display refresh rate. Allocating a new
+   * typed array per call (the previous behaviour) churned the main-thread heap
+   * 60×/s across two visualizers, and that GC pressure is exactly the kind of
+   * main-thread stall that starves the audio graph and produces underruns. The
+   * buffers are sized once from the analyser and handed back to be overwritten on
+   * the next call; every caller in this codebase consumes them immediately.
+   *
+   * The `ArrayBuffer` type argument matters: TS 5.7+ parameterises typed arrays
+   * by their backing buffer, and the analyser getters accept only
+   * `Uint8Array<ArrayBuffer>` / `Float32Array<ArrayBuffer>`. `new Uint8Array(n)`
+   * infers that, but the field would otherwise widen to `ArrayBufferLike`.
+   */
+  private _freqData: Uint8Array<ArrayBuffer> | null = null;
+  private _waveData: Uint8Array<ArrayBuffer> | null = null;
+  private _floatFreqData: Float32Array<ArrayBuffer> | null = null;
+  private _floatTimeData: Float32Array<ArrayBuffer> | null = null;
+
   getAnalyserData(): Uint8Array {
-    const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
-    this.analyser.getByteFrequencyData(dataArray);
-    return dataArray;
+    if (!this._freqData || this._freqData.length !== this.analyser.frequencyBinCount) {
+      this._freqData = new Uint8Array(this.analyser.frequencyBinCount);
+    }
+    this.analyser.getByteFrequencyData(this._freqData);
+    return this._freqData;
   }
 
   getWaveformData(): Uint8Array {
-    const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
-    this.analyser.getByteTimeDomainData(dataArray);
-    return dataArray;
+    if (!this._waveData || this._waveData.length !== this.analyser.frequencyBinCount) {
+      this._waveData = new Uint8Array(this.analyser.frequencyBinCount);
+    }
+    this.analyser.getByteTimeDomainData(this._waveData);
+    return this._waveData;
   }
 
   getFloatFrequencyData(): Float32Array {
-    const dataArray = new Float32Array(this.analyser.frequencyBinCount);
-    this.analyser.getFloatFrequencyData(dataArray);
-    return dataArray;
+    if (!this._floatFreqData || this._floatFreqData.length !== this.analyser.frequencyBinCount) {
+      this._floatFreqData = new Float32Array(this.analyser.frequencyBinCount);
+    }
+    this.analyser.getFloatFrequencyData(this._floatFreqData);
+    return this._floatFreqData;
   }
 
   getFloatTimeDomainData(): Float32Array {
-    const dataArray = new Float32Array(this.analyser.fftSize);
-    this.analyser.getFloatTimeDomainData(dataArray);
-    return dataArray;
+    if (!this._floatTimeData || this._floatTimeData.length !== this.analyser.fftSize) {
+      this._floatTimeData = new Float32Array(this.analyser.fftSize);
+    }
+    this.analyser.getFloatTimeDomainData(this._floatTimeData);
+    return this._floatTimeData;
   }
 
   addTrack(buffer: AudioBuffer, name: string) {
@@ -892,9 +1081,12 @@ export class AudioEngine {
 
         const gainNode = this.ctx.createGain();
         const hasSolo = this.tracks.some(t => t.solo);
-        gainNode.gain.value = hasSolo
+        const targetGain = hasSolo
           ? (track.solo && !track.muted ? track.volume : 0)
           : (track.muted ? 0 : track.volume);
+        // Start from silence and ramp to the target so a track added mid-playback
+        // does not begin on a step (a click).
+        gainNode.gain.value = 0;
 
         const pannerNode = this.ctx.createStereoPanner();
         pannerNode.pan.value = track.pan;
@@ -915,6 +1107,11 @@ export class AudioEngine {
 
         const trackStartOffset = this.isLooping ? (offset % buffer.duration) : offset;
         sourceNode.start(0, trackStartOffset);
+        try {
+          gainNode.gain.linearRampToValueAtTime(targetGain, this.ctx.currentTime + TRANSPORT_FADE);
+        } catch (e) {
+          gainNode.gain.value = targetGain;
+        }
       }
     }
 
@@ -925,7 +1122,19 @@ export class AudioEngine {
   removeTrack(id: string) {
     const track = this.tracks.find(t => t.id === id);
     if (track && track.sourceNode) {
-      try { track.sourceNode.stop(); } catch (e) {}
+      // Fade the lane out before stopping it; an abrupt stop clicks.
+      const source = track.sourceNode;
+      const gain = track.gainNode;
+      if (gain) {
+        try {
+          gain.gain.cancelScheduledValues(this.ctx.currentTime);
+          gain.gain.setValueAtTime(gain.gain.value, this.ctx.currentTime);
+          gain.gain.linearRampToValueAtTime(0, this.ctx.currentTime + TRANSPORT_FADE);
+        } catch (e) {}
+      }
+      window.setTimeout(() => {
+        try { source.stop(); } catch (e) {}
+      }, TRANSPORT_FADE * 1000 + 20);
     }
     this.tracks = this.tracks.filter(t => t.id !== id);
     this.rebuildMixer();
@@ -936,7 +1145,9 @@ export class AudioEngine {
     const track = this.tracks.find(t => t.id === id);
     if (track) {
       track.volume = vol;
-      if (track.gainNode) track.gainNode.gain.value = track.muted ? 0 : vol;
+      if (track.gainNode) {
+        this.rampGain(track.gainNode, track.muted ? 0 : vol);
+      }
       this.onStateChange();
     }
   }
@@ -945,7 +1156,10 @@ export class AudioEngine {
     const track = this.tracks.find(t => t.id === id);
     if (track) {
       track.pan = pan;
-      if (track.pannerNode) track.pannerNode.pan.value = pan;
+      if (track.pannerNode) {
+        // Pan is an AudioParam too; a raw write on a fast drag zippers.
+        this.rampParam(track.pannerNode.pan, pan);
+      }
       this.onStateChange();
     }
   }
@@ -972,11 +1186,28 @@ export class AudioEngine {
     const hasSolo = this.tracks.some(t => t.solo);
     this.tracks.forEach(track => {
       if (track.gainNode) {
-        track.gainNode.gain.value = hasSolo
+        const target = hasSolo
           ? (track.solo && !track.muted ? track.volume : 0)
           : (track.muted ? 0 : track.volume);
+        // Mute/solo is a gain step; ramp it so toggling does not pop.
+        this.rampGain(track.gainNode, target);
       }
     });
+  }
+
+  /** Short smoothing ramp on an arbitrary AudioParam (drags, mute/solo, volume). */
+  private rampParam(param: AudioParam, value: number, seconds = 0.02) {
+    if (!Number.isFinite(value)) return;
+    try {
+      param.cancelScheduledValues(this.ctx.currentTime);
+      param.setTargetAtTime(value, this.ctx.currentTime, seconds);
+    } catch (e) {
+      param.value = value;
+    }
+  }
+
+  private rampGain(node: GainNode, value: number) {
+    this.rampParam(node.gain, value);
   }
 
   private rebuildMixer() {}
@@ -1409,6 +1640,8 @@ export class AudioEngine {
    * remount, which is a hard leak on hot-reload and in tests.
    */
   dispose() {
+    this.cancelPendingTeardown();
+    this.removeLifecycleListeners();
     try {
       this.stop();
     } catch (e) {}
